@@ -39,6 +39,7 @@ static void check_parser(void)
 {
     int codec, level;
     assert(parse_compression(NULL, &codec, &level) == 0 && codec == COMP_OFF);
+    assert(parse_compression("off", &codec, &level) == 0 && codec == COMP_OFF);
     assert(parse_compression("0", &codec, &level) == 0 && codec == COMP_OFF);
     assert(parse_compression("1", &codec, &level) == 0 && codec == COMP_LZ4);
     assert(parse_compression("lz4", &codec, &level) == 0 && codec == COMP_LZ4);
@@ -88,6 +89,7 @@ int main(int argc, char **argv)
     _cuMemcpyDtoHAsync = copy_from_device;
     _cuStreamSynchronize = synchronize;
     assert(compress_init() == 0);
+    assert(!g_dedup_index && !g_dedup_ptes);
     assert(g_export_size == g_npages * COMP_PAGE);
     assert(oob(g_export_size, 1));
     assert(g_compress == COMP_ZSTD ? !g_liblz4 : !g_libzstd);

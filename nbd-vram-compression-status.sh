@@ -1,6 +1,6 @@
 #!/bin/sh
 # nbd-vram-compression-status.sh - show live compression codec, level and ratio for VRAM swap
-# Reads /run/nbd-vram.status (updated ~1s by the daemon when compression is enabled).
+# Reads /run/nbd-vram.status (updated ~1s by the daemon when compression or deduplication is enabled).
 
 STATUS=/run/nbd-vram.status
 
@@ -13,8 +13,8 @@ mib() {
 
 if [ ! -f "$STATUS" ]; then
     if [ -S /run/nbd-vram.sock ] || pgrep -x nbd-vram >/dev/null 2>&1; then
-        echo "nbd-vram is running without compression (VRAM_COMPRESS=0)."
-        echo "Set VRAM_COMPRESS=lz4 or zstd:3 to pack pages in VRAM and see a live ratio here."
+        echo "nbd-vram is running without compression or deduplication (or status is not ready yet)."
+        echo "Enable VRAM_COMPRESS=lz4/zstd:3 or VRAM_DEDUP=1 to see storage stats here."
         echo ""
         swapon --show 2>/dev/null || true
         exit 0
@@ -24,8 +24,10 @@ if [ ! -f "$STATUS" ]; then
 fi
 
 compress=$(kv compress)
-if [ "$compress" != "1" ]; then
-    echo "nbd-vram compression is off."
+dedup=$(kv dedup)
+dedup=${dedup:-0}
+if [ "$compress" != "1" ] && [ "$dedup" != "1" ]; then
+    echo "nbd-vram compression and deduplication are off."
     exit 0
 fi
 
@@ -42,6 +44,11 @@ zstd=$(kv pages_zstd)
 raw=$(kv pages_raw)
 same=$(kv pages_same)
 enospc=$(kv enospc)
+dedup_pages=$(kv dedup_pages)
+dedup_unique=$(kv dedup_unique_pages)
+dedup_saved=$(kv dedup_saved_bytes)
+dedup_hits=$(kv dedup_hits)
+dedup_index=$(kv dedup_index_bytes)
 
 algorithm=${algorithm:-lz4}
 level=${level:-0}
@@ -56,6 +63,11 @@ zstd=${zstd:-0}
 raw=${raw:-0}
 same=${same:-0}
 enospc=${enospc:-0}
+dedup_pages=${dedup_pages:-0}
+dedup_unique=${dedup_unique:-0}
+dedup_saved=${dedup_saved:-0}
+dedup_hits=${dedup_hits:-0}
+dedup_index=${dedup_index:-0}
 
 pages=$(( lz4 + zstd + raw + same ))
 stored_bytes=$(( pages * 4096 ))
@@ -81,7 +93,7 @@ elif [ "$pages" -gt 0 ]; then
     eff="inf"
 fi
 
-echo "nbd-vram compression"
+echo "nbd-vram compression and deduplication"
 echo ""
 if [ "$algorithm" = "zstd" ]; then
     echo "  codec            : zstd:${level}"
@@ -98,6 +110,19 @@ echo "  VRAM pool        : ${slab_mib} / ${vram_mib} MiB  (${pool_pct}% full)"
 echo "  packed objects   : ${obj_mib} MiB  (size-class occupancy inside those slabs)"
 echo "  swap device      : ${stored_mib} / ${export_mib} MiB stored  (${logical_pct}% of advertised size)"
 echo "  pages            : ${pages}  (lz4 ${lz4}, zstd ${zstd}, uncompressed ${raw}, same-filled ${same})"
+if [ "$dedup" = "1" ]; then
+    saved_mib=$(awk -v b="$dedup_saved" 'BEGIN { printf "%.2f", b / 1048576 }')
+    index_mib=$(awk -v b="$dedup_index" 'BEGIN { printf "%.2f", b / 1048576 }')
+    net_mib=$(awk -v saved="$dedup_saved" -v index_bytes="$dedup_index" 'BEGIN { printf "%.2f", (saved - index_bytes) / 1048576 }')
+    echo "  deduplication    : on"
+    echo "  deduped pages    : ${dedup_pages} extra copies avoided (${dedup_unique} unique payloads)"
+    echo "  dedup savings    : ${dedup_saved} bytes (${saved_mib} MiB of object slots)"
+    echo "  dedup matches    : ${dedup_hits} matching page writes since start"
+    echo "  dedup index RAM  : ${dedup_index} bytes"
+    echo "  dedup net savings : ~${net_mib} MiB (${saved_mib} MiB VRAM saved − ${index_mib} MiB system RAM for index)"
+else
+    echo "  deduplication    : off"
+fi
 echo "  ENOSPC writes    : ${enospc}"
 echo ""
 
@@ -106,7 +131,7 @@ if [ "$pages" -lt 256 ]; then
     echo "        memory pressure, then run nbd-vram-compression-status.sh again."
 elif [ "$enospc" -gt 0 ]; then
     echo "  Hint: the VRAM pool filled before the advertised swap device did."
-    echo "        Data is not compressing enough for ratio ${cfg}x - keep or lower"
+    echo "        Data is not shrinking enough for ratio ${cfg}x - keep or lower"
     echo "        VRAM_COMPRESS_RATIO. Do not increase it."
 elif [ "$payload" -lt 256 ] && [ "$same" -gt "$payload" ]; then
     echo "  Hint: almost everything stored is same-filled (zeros), which takes no"

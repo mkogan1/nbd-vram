@@ -53,7 +53,7 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 - Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
-- `liblz4.so.1` only for `VRAM_COMPRESS=1` or `lz4` (`liblz4-1` / `lz4-libs`)
+- `liblz4.so.1` only for `VRAM_COMPRESS=lz4` (`liblz4-1` / `lz4-libs`)
 - `libzstd.so.1` only for `VRAM_COMPRESS=zstd` or `zstd:LEVEL` (`libzstd1` / `libzstd`)
 
 ---
@@ -75,7 +75,7 @@ swapon --show
 # /dev/nbd0  partition   7G   0B 1500
 ```
 
-The service is enabled on install, so it comes up automatically on every boot.
+The installer asks whether to enable the service at boot, defaulting to its current setting (no on a fresh install). Non-interactive installs preserve that setting. The installer also starts or restarts the service immediately, regardless of the boot-start choice.
 
 ---
 
@@ -88,8 +88,9 @@ Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
 Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
 Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
-Environment=VRAM_COMPRESS=0            # 0 = off; 1/lz4, zstd, or zstd:LEVEL (1-22)
-Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compression is enabled (1.0-8.0)
+Environment=VRAM_COMPRESS=off          # off, lz4, zstd, or zstd:LEVEL (1-22)
+Environment=VRAM_DEDUP=0              # 1 = share identical pages (optional)
+Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compression or dedup is enabled (1.0-8.0)
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
@@ -98,7 +99,7 @@ The daemon tries the requested size first and backs off in 512 MiB steps if the 
 
 ### Compression
 
-Off by default. Set `VRAM_COMPRESS=lz4` (or the backward-compatible `1`) or `VRAM_COMPRESS=zstd:3` to pack compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
+Off by default (`VRAM_COMPRESS=off`). Set `VRAM_COMPRESS=lz4` or `VRAM_COMPRESS=zstd:3` to pack compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
 
 This is not zswap (which caches compressed pages in system RAM) and not zram (which is RAM-backed). The compressed bytes live in VRAM. Cost is extra CPU per page fault and the loss of the 1:1 copy batching path. LZ4 requires `liblz4.so.1` (`liblz4-1` on Debian/Pop!_OS, `lz4-libs` on Fedora); Zstandard requires `libzstd.so.1` (`libzstd1` on Debian/Pop!_OS, `libzstd` on Fedora). Only the selected library is loaded; no codec development headers are needed to build. The installer prompts for this; after a manual edit, `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
 
@@ -109,13 +110,37 @@ Environment=VRAM_COMPRESS=zstd:3
 Environment=VRAM_COMPRESS_RATIO=2.0
 ```
 
-`zstd` alone defaults to level 3. Higher levels spend more CPU on compression and can increase swap-write latency; the level does not change the advertised device size. `VRAM_COMPRESS_RATIO` controls that size separately. Invalid codec names or levels fail startup. Pages that do not shrink are stored uncompressed. The codec and level are fixed until the service restarts; the installer preserves them on reinstall.
+`zstd` alone defaults to level 3. Legacy `0` (off) and `1` (lz4) remain accepted; the installer saves the named values. Higher levels spend more CPU on compression and can increase swap-write latency; the level does not change the advertised device size. `VRAM_COMPRESS_RATIO` controls that size separately. Invalid codec names or levels fail startup. Pages that do not shrink are stored uncompressed. The codec and level are fixed until the service restarts; the installer preserves them on reinstall.
 
-When compression is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
+When compression or deduplication is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
 
 Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows the codec and level, configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+
+### Page deduplication
+
+Set `VRAM_DEDUP=1` to store identical 4 KiB pages once, with reference counting:
+
+```ini
+Environment=VRAM_COMPRESS=zstd:3
+Environment=VRAM_DEDUP=1
+Environment=VRAM_COMPRESS_RATIO=2.0
+```
+
+Off by default. The installer offers `Page deduplication (off, on)` and preserves the setting on reinstall. Deduplication works with LZ4, Zstandard, or `VRAM_COMPRESS=off`; raw pages that do not compress can also share storage. With deduplication alone, `VRAM_COMPRESS_RATIO` still controls logical device size. Changes take effect after a service restart.
+
+A hash finds candidates, then the daemon reads the candidate from VRAM and compares all 4096 original bytes. Hash collisions cannot merge different pages. Shared payloads are immutable: overwriting or partially modifying a page changes only its own reference. TRIM or overwrite frees a payload when its final reference is removed. Same-filled pages already take no VRAM and are excluded from deduplication counts.
+
+`nbd-vram-compression-status.sh` adds:
+
+- **deduped pages**: current extra copies avoided. Three pages sharing one payload count as two deduped pages. This is a subset of the existing page totals, not an additional page type.
+- **dedup savings**: object-slot bytes avoided after compression, including size-class rounding. This does not imply the same number of whole slabs became free.
+- **dedup matches**: successful page writes that reused an existing payload since startup, including rewriting a page with identical contents. Failed batches do not increase this counter.
+- **dedup index RAM**: memory for the lookup table, per-page references, and unique-payload records (excluding allocator overhead).
+- **dedup net savings**: VRAM object storage saved minus system RAM used by the index, displayed in MiB. Can be negative when the index costs more than deduplication saves.
+
+Deduplication adds CPU hashing, VRAM reads to verify candidates, and host RAM metadata. Dedup write commits are serialized while verifying and updating references; ordinary reads still run in parallel. These costs can reduce throughput, so enable it when repeated pages save enough space. On 64-bit systems, the index uses 8 bytes per logical page, 48 bytes per unique payload, and a hash table of up to 8 MiB; this memory is covered by the daemon's existing memory locking.
 
 ---
 
@@ -153,7 +178,7 @@ This is the natural trade-off of swapping to VRAM: it is free memory, right up u
 
 ## Smoke test (without installing)
 
-CPU-only compression regression tests (requires both runtime codec libraries):
+CPU-only compression and deduplication regression tests (requires both runtime codec libraries and Python 3):
 
 ```sh
 make test

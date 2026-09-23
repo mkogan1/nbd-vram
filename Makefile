@@ -14,4 +14,7 @@ install: nbd-vram
 test:
 	@set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	$(CC) -O2 -g -Wall -Wextra -Werror $(CFLAGS) -o "$$tmp/test-compression" test-compression.c -ldl -lpthread; \
-	for codec in 1 lz4 zstd zstd:1 zstd:9 zstd:22; do "$$tmp/test-compression" "$$codec"; done
+	for codec in 1 lz4 zstd zstd:1 zstd:9 zstd:22; do "$$tmp/test-compression" "$$codec"; done; \
+	$(CC) -O2 -g -Wall -Wextra -Werror $(CFLAGS) -o "$$tmp/test-dedup" test-dedup.c -ldl -lpthread; \
+	for codec in off 0 lz4 zstd:3 zstd:22; do "$$tmp/test-dedup" "$$codec"; done; \
+	python3 test-storage-scripts.py

@@ -18,6 +18,7 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Remember previously-installed knobs so a reinstall can default to them
 PREV_ALLOC=$(grep -oE 'VRAM_SETUP_SIZE_MB=[0-9]+' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | grep -oE '[0-9]+$' || true)
 PREV_COMPRESS=$(sed -n 's/^Environment=VRAM_COMPRESS=\([^[:space:]]*\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
+PREV_DEDUP=$(sed -n 's/^Environment=VRAM_DEDUP=\([01]\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 PREV_RATIO=$(sed -n 's/^Environment=VRAM_COMPRESS_RATIO=\([0-9]\+\(\.[0-9]\)\?\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 
 echo "=== nbd-vram installer ==="
@@ -178,16 +179,29 @@ if [ -t 0 ]; then
         read -r COMPRESS || COMPRESS=""
         COMPRESS=${COMPRESS:-$COMPRESS_DEFAULT}
         case "$COMPRESS" in
-            off|0) COMPRESS=0; break ;;
+            off|0) COMPRESS=off; break ;;
             1) COMPRESS=lz4; break ;;
             lz4|zstd|zstd:[1-9]|zstd:1[0-9]|zstd:2[0-2]) break ;;
             *) echo "  please enter off, lz4, zstd, or zstd:LEVEL with a level from 1 to 22" ;;
         esac
     done
+    DEDUP_DEFAULT=off
+    [ "${PREV_DEDUP:-0}" = "1" ] && DEDUP_DEFAULT=on
+    echo "Deduplication shares identical pages; it uses extra RAM and compares matches in VRAM."
+    while :; do
+        printf "Page deduplication (off, on) [%s]: " "$DEDUP_DEFAULT"
+        read -r DEDUP || DEDUP=""
+        DEDUP=${DEDUP:-$DEDUP_DEFAULT}
+        case "$DEDUP" in
+            off|0) DEDUP=0; break ;;
+            on|1) DEDUP=1; break ;;
+            *) echo "  please enter off or on" ;;
+        esac
+    done
     RATIO=${PREV_RATIO:-2.0}
-    if [ "$COMPRESS" != "0" ]; then
+    if [ "$COMPRESS" != "off" ] || [ "$DEDUP" = "1" ]; then
         while :; do
-            printf "Compression ratio (logical size / VRAM, 1.0-8.0, one decimal) [%s]: " "$RATIO"
+            printf "Logical size / VRAM ratio (1.0-8.0, one decimal) [%s]: " "$RATIO"
             read -r RATIO_REPLY || RATIO_REPLY=""
             RATIO_REPLY=${RATIO_REPLY:-$RATIO}
             case "$RATIO_REPLY" in
@@ -205,6 +219,8 @@ if [ -t 0 ]; then
             RATIO=$RATIO_REPLY
             break
         done
+    fi
+    if [ "$COMPRESS" != "off" ]; then
         case "$COMPRESS" in
             zstd*) CODEC_LIB=libzstd.so.1; CODEC_PACKAGE=libzstd1 ;;
             *)     CODEC_LIB=liblz4.so.1; CODEC_PACKAGE=liblz4-1 ;;
@@ -216,17 +232,25 @@ if [ -t 0 ]; then
             }
         fi
     fi
+    sed -i "s/^Environment=VRAM_DEDUP=.*/Environment=VRAM_DEDUP=${DEDUP}/" /etc/systemd/system/vram-swap-nbd.service
     sed -i "s/^Environment=VRAM_COMPRESS=.*/Environment=VRAM_COMPRESS=${COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
     sed -i "s/^Environment=VRAM_COMPRESS_RATIO=[0-9]\+\(\.[0-9]\)\?/Environment=VRAM_COMPRESS_RATIO=${RATIO}/" /etc/systemd/system/vram-swap-nbd.service
-    if [ "$COMPRESS" != "0" ]; then
+    if [ "$COMPRESS" != "off" ] || [ "$DEDUP" = "1" ]; then
         EXPORT_MIB=$(awk -v a="$ALLOC" -v r="$RATIO" 'BEGIN { printf "%d", a * r }')
-        echo "      ${COMPRESS} compression on, ratio ${RATIO} (${ALLOC} MiB VRAM -> ${EXPORT_MIB} MiB swap)"
+        echo "      compression=${COMPRESS}, dedup=${DEDUP}, ratio ${RATIO} (${ALLOC} MiB VRAM -> ${EXPORT_MIB} MiB swap)"
     else
-        echo "      compression off (1:1 VRAM mapping)"
+        echo "      compression and deduplication off (1:1 VRAM mapping)"
     fi
 else
-    # Non-interactive reinstall: keep previous compress knobs if present
+    # Non-interactive reinstall: keep previous storage knobs if present
+    if [ -n "$PREV_DEDUP" ]; then
+        sed -i "s/^Environment=VRAM_DEDUP=.*/Environment=VRAM_DEDUP=${PREV_DEDUP}/" /etc/systemd/system/vram-swap-nbd.service
+    fi
     if [ -n "$PREV_COMPRESS" ]; then
+        case "$PREV_COMPRESS" in
+            0) PREV_COMPRESS=off ;;
+            1) PREV_COMPRESS=lz4 ;;
+        esac
         sed -i "s/^Environment=VRAM_COMPRESS=.*/Environment=VRAM_COMPRESS=${PREV_COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
     fi
     if [ -n "$PREV_RATIO" ]; then
@@ -234,10 +258,35 @@ else
     fi
 fi
 
-# Enable and (re)start
-echo "[4/4] Enabling vram-swap-nbd.service..."
+# Configure startup, then (re)start below.
+echo "[4/4] Configuring service startup..."
 systemctl daemon-reload
-systemctl enable vram-swap-nbd.service
+if [ -t 0 ]; then
+    ENABLE_DEFAULT=n
+    ENABLE_PROMPT=y/N
+    if systemctl is-enabled --quiet vram-swap-nbd.service 2>/dev/null; then
+        ENABLE_DEFAULT=y
+        ENABLE_PROMPT=Y/n
+    fi
+    while :; do
+        printf "Enable vram-swap-nbd.service to start automatically at boot? [%s]: " "$ENABLE_PROMPT"
+        read -r ENABLE_REPLY || ENABLE_REPLY=""
+        ENABLE_REPLY=${ENABLE_REPLY:-$ENABLE_DEFAULT}
+        case "$ENABLE_REPLY" in
+            y|Y|yes|YES)
+                systemctl enable vram-swap-nbd.service
+                break
+                ;;
+            n|N|no|NO)
+                systemctl disable vram-swap-nbd.service
+                break
+                ;;
+            *) echo "  please enter yes or no" ;;
+        esac
+    done
+else
+    echo "      non-interactive run: preserving the current boot-start setting"
+fi
 # Tear down VRAM swap before the GPU powers off on suspend, restore it on resume.
 # Always-on: it's a correctness fix (issue #19), and on a machine that never
 # suspends the hook simply never fires.

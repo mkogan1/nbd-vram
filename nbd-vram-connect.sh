@@ -34,9 +34,9 @@ echo "nbd-vram-connect: using $NBD_DEV"
 nbd-client -d "$NBD_DEV" 2>/dev/null || true
 nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-4}
 mkswap "$NBD_DEV"
-# discard=pages lets the kernel TRIM freed swap slots so the compressed pool
-# can reclaim VRAM. Harmless no-op when compression is off (TRIM is not advertised).
-if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
+# discard=pages lets the kernel TRIM freed swap slots so the packed page pool
+# can reclaim VRAM. Harmless no-op when both compression and dedup are off (TRIM is not advertised).
+if [ "${VRAM_COMPRESS:-off}" != "off" ] && [ "${VRAM_COMPRESS:-off}" != "0" ] || [ "${VRAM_DEDUP:-0}" = "1" ]; then
     swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}" --discard=pages
 else
     swapon "$NBD_DEV" -p "${VRAM_SWAP_PRIORITY:-1500}"
@@ -45,8 +45,8 @@ fi
 # Save device name so disconnect script knows what to clean up
 echo "$NBD_DEV" > /run/nbd-vram-dev
 SIZE_MIB=$(( $(blockdev --getsize64 "$NBD_DEV") / 1024 / 1024 ))
-if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
-    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, ${VRAM_COMPRESS} compression on, ratio ${VRAM_COMPRESS_RATIO:-2.0}x, discard=pages)"
+if [ "${VRAM_COMPRESS:-off}" != "off" ] && [ "${VRAM_COMPRESS:-off}" != "0" ] || [ "${VRAM_DEDUP:-0}" = "1" ]; then
+    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, compression=${VRAM_COMPRESS:-off}, dedup=${VRAM_DEDUP:-0}, ratio ${VRAM_COMPRESS_RATIO:-2.0}x, discard=pages)"
 else
-    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, compression off)"
+    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, compression and deduplication off)"
 fi
