@@ -53,7 +53,8 @@ The NBD approach sidesteps all of this. `cuMemcpyHtoD` and `cuMemcpyDtoH` work o
 - Linux kernel 5.6+ recommended, since that is where `PR_SET_IO_FLUSHER` landed and the swap-deadlock protection leans on it, though older kernels still run with that one safeguard disabled (the `nbd` module itself is built into most distros)
 - `nbd-client` package
 - `gcc`, `make`
-- `liblz4.so.1` only if you enable `VRAM_COMPRESS=1` (`liblz4-1` / `lz4-libs`)
+- `liblz4.so.1` only for `VRAM_COMPRESS=1` or `lz4` (`liblz4-1` / `lz4-libs`)
+- `libzstd.so.1` only for `VRAM_COMPRESS=zstd` or `zstd:LEVEL` (`libzstd1` / `libzstd`)
 
 ---
 
@@ -87,8 +88,8 @@ Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
 Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
 Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
-Environment=VRAM_COMPRESS=0            # 1 = lz4-compress pages in VRAM (needs liblz4)
-Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compress=1 (1.0-8.0)
+Environment=VRAM_COMPRESS=0            # 0 = off; 1/lz4, zstd, or zstd:LEVEL (1-22)
+Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compression is enabled (1.0-8.0)
 ```
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
@@ -97,13 +98,22 @@ The daemon tries the requested size first and backs off in 512 MiB steps if the 
 
 ### Compression
 
-Off by default. Set `VRAM_COMPRESS=1` to pack lz4-compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
+Off by default. Set `VRAM_COMPRESS=lz4` (or the backward-compatible `1`) or `VRAM_COMPRESS=zstd:3` to pack compressed 4K pages into the CUDA allocation, and advertise a larger NBD device (`VRAM_COMPRESS_RATIO` times the VRAM size, default 2.0x). `VRAM_COMPRESS_RATIO` accepts `X` or `X.Y` with one decimal place (range `1.0` to `8.0`, for example `2.5`). Same-filled pages (zeros) take no VRAM. Typical anonymous memory is around 2–3× with lz4, so 7 GiB of VRAM can back on the order of 14–21 GiB of swap if the data compresses; if it does not, writes return `ENOSPC` and the kernel can fall through to lower-priority swap (zram/SSD).
 
-This is not zswap (which caches compressed pages in system RAM) and not zram (which is RAM-backed). The compressed bytes live in VRAM. Cost is extra CPU per page fault and the loss of the 1:1 copy batching path. Requires `liblz4.so.1` (`liblz4-1` on Debian/Pop!_OS, `lz4-libs` on Fedora). The installer prompts for this; after a manual edit, `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+This is not zswap (which caches compressed pages in system RAM) and not zram (which is RAM-backed). The compressed bytes live in VRAM. Cost is extra CPU per page fault and the loss of the 1:1 copy batching path. LZ4 requires `liblz4.so.1` (`liblz4-1` on Debian/Pop!_OS, `lz4-libs` on Fedora); Zstandard requires `libzstd.so.1` (`libzstd1` on Debian/Pop!_OS, `libzstd` on Fedora). Only the selected library is loaded; no codec development headers are needed to build. The installer prompts for this; after a manual edit, `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
+
+Use `VRAM_COMPRESS=zstd:LEVEL` for a Zstandard level from **1 to 22**, for example:
+
+```ini
+Environment=VRAM_COMPRESS=zstd:3
+Environment=VRAM_COMPRESS_RATIO=2.0
+```
+
+`zstd` alone defaults to level 3. Higher levels spend more CPU on compression and can increase swap-write latency; the level does not change the advertised device size. `VRAM_COMPRESS_RATIO` controls that size separately. Invalid codec names or levels fail startup. Pages that do not shrink are stored uncompressed. The codec and level are fixed until the service restarts; the installer preserves them on reinstall.
 
 When compression is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
 
-Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
+Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows the codec and level, configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
 
@@ -133,6 +143,8 @@ If you want to use the GPU heavily at the same time, pick one:
 
 **Leave headroom** choose a smaller allocation when the installer asks, or change `VRAM_SETUP_SIZE_MB` in `/etc/systemd/system/vram-swap-nbd.service` later (e.g. `4096` keeps 4 GB for the GPU).
 
+The installer lets you exceed its recommendation while leaving 1024 MiB for the GPU. For example, a 4096 MiB GPU can allocate 3072 MiB to swap, including when it drives a display.
+
 **Stop it while you need the card** `sudo systemctl stop vram-swap-nbd`, then start it again afterwards. Swapped pages migrate back to RAM and other swap first.
 
 This is the natural trade-off of swapping to VRAM: it is free memory, right up until you want the GPU for something else.
@@ -140,6 +152,14 @@ This is the natural trade-off of swapping to VRAM: it is free memory, right up u
 ---
 
 ## Smoke test (without installing)
+
+CPU-only compression regression tests (requires both runtime codec libraries):
+
+```sh
+make test
+```
+
+These use simulated VRAM and do not activate swap. For the GPU/NBD smoke test:
 
 ```sh
 sudo bash test-nbd.sh

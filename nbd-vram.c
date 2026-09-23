@@ -3,8 +3,8 @@
  * Implements NBD fixed-newstyle protocol over a Unix socket.
  * No NVIDIA P2P or kernel symbols needed - uses cuMemcpyHtoDAsync/DtoHAsync.
  *
- * Optional lz4 compression (VRAM_COMPRESS=1) stores swap pages packed in VRAM
- * so the NBD export can be larger than the CUDA allocation. Needs liblz4.so.1.
+ * Optional lz4/zstd compression stores swap pages packed in VRAM so the NBD
+ * export can be larger than the CUDA allocation. Loads the selected codec at runtime.
  *
  * Compile: gcc -O2 -o nbd-vram nbd-vram.c -ldl -lpthread
  */
@@ -383,7 +383,9 @@ static int nbd_handshake(int fd, uint64_t export_size, int send_trim)
 static CUdeviceptr  g_vram_ptr;
 static uint64_t     g_vram_size;
 static uint64_t     g_export_size;           /* NBD device size; > g_vram_size when compressed */
-static int          g_compress;              /* VRAM_COMPRESS=1 */
+enum compression { COMP_OFF, COMP_LZ4, COMP_ZSTD };
+static int          g_compress;              /* enum compression */
+static int          g_compress_level = 3;     /* zstd level, 1..22 */
 static int          g_compress_ratio_tenths = 20; /* VRAM_COMPRESS_RATIO in 0.1x units */
 static CUcontext    g_cu_ctx;
 static int          g_listen_fd  = -1;
@@ -399,6 +401,39 @@ static unsigned long g_batch_ops     = 0;                  /* ops in those n>1 f
 static unsigned long g_flush_count   = 0;                  /* every batched-path flush, incl n==1 */
 static unsigned long g_flush_ops     = 0;                  /* ops across all flushes (true depth) */
 static unsigned long g_legacy_ops    = 0;                  /* READ/WRITE via the per-op path */
+
+/* Keep the original 0/1 interface while allowing an explicit codec and level. */
+static int parse_compression(const char *s, int *codec, int *level)
+{
+    int c = COMP_OFF, l = 3;
+    if (!s || strcmp(s, "0") == 0) {
+        c = COMP_OFF;
+    } else if (strcmp(s, "1") == 0 || strcmp(s, "lz4") == 0) {
+        c = COMP_LZ4;
+    } else if (strcmp(s, "zstd") == 0) {
+        c = COMP_ZSTD;
+    } else if (strncmp(s, "zstd:", 5) == 0) {
+        const char *p = s + 5;
+        if (*p < '1' || *p > '9') return -1;
+        l = 0;
+        for (; *p; p++) {
+            if (*p < '0' || *p > '9') return -1;
+            l = l * 10 + (*p - '0');
+            if (l > 22) return -1;
+        }
+        c = COMP_ZSTD;
+    } else {
+        return -1;
+    }
+    *codec = c;
+    *level = l;
+    return 0;
+}
+
+static const char *compression_name(void)
+{
+    return g_compress == COMP_ZSTD ? "zstd" : g_compress == COMP_LZ4 ? "lz4" : "off";
+}
 
 /* Parse X or X.Y where X is 1..8 and Y is one decimal digit. */
 static int parse_ratio_tenths(const char *s, int *out)
@@ -482,7 +517,7 @@ static inline int oob(uint64_t offset, uint32_t length) {
 }
 
 /* -------------------------------------------------------------------------
- * Optional lz4 compressed VRAM store (VRAM_COMPRESS=1)
+ * Optional compressed VRAM store (lz4 or zstd)
  *
  * Logical 4K pages are packed into the CUDA allocation. The NBD export is
  * VRAM_COMPRESS_RATIO times the physical size. Same-filled pages (zeros) take
@@ -493,13 +528,15 @@ static inline int oob(uint64_t offset, uint32_t length) {
 #define COMP_BATCH   32
 #define SLAB_SZ      (64 * 1024)
 #define NPLOCK       1024
+#ifndef STATUS_PATH
 #define STATUS_PATH  "/run/nbd-vram.status"
-#define STATUS_TMP   "/run/nbd-vram.status.tmp"
+#endif
+#define STATUS_TMP   STATUS_PATH ".tmp"
 
-#define PTE_NONE  0
-#define PTE_LZ4   1
-#define PTE_RAW   2
-#define PTE_SAME  3
+#define PTE_NONE       0
+#define PTE_COMPRESSED 1
+#define PTE_RAW        2
+#define PTE_SAME       3
 
 static const uint16_t k_class_sz[] = {
     32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448,
@@ -554,6 +591,23 @@ static void                      *g_liblz4;
 static pfn_LZ4_compress_default   _LZ4_compress_default;
 static pfn_LZ4_decompress_safe    _LZ4_decompress_safe;
 
+/* Opaque stable-API types keep codec development headers optional. */
+typedef struct ZSTD_CCtx_s ZSTD_CCtx;
+typedef struct ZSTD_DCtx_s ZSTD_DCtx;
+static void *g_libzstd;
+static ZSTD_CCtx *(*_ZSTD_createCCtx)(void);
+static ZSTD_DCtx *(*_ZSTD_createDCtx)(void);
+static size_t (*_ZSTD_freeCCtx)(ZSTD_CCtx *);
+static size_t (*_ZSTD_freeDCtx)(ZSTD_DCtx *);
+static size_t (*_ZSTD_compressCCtx)(ZSTD_CCtx *, void *, size_t, const void *, size_t, int);
+static size_t (*_ZSTD_decompressDCtx)(ZSTD_DCtx *, void *, size_t, const void *, size_t);
+static unsigned (*_ZSTD_isError)(size_t);
+static int (*_ZSTD_maxCLevel)(void);
+static ZSTD_CCtx *g_zstd_cctx[NBD_THREADS_MAX];
+static ZSTD_DCtx *g_zstd_dctx[NBD_THREADS_MAX];
+static __thread ZSTD_CCtx *t_zstd_cctx;
+static __thread ZSTD_DCtx *t_zstd_dctx;
+
 static struct pte     *g_ptes;
 static uint64_t        g_npages;
 static struct szclass  g_cls[NCLASS];
@@ -563,7 +617,7 @@ static uint32_t        g_nchunks, g_nfree_chunks, g_chunk_hint;
 static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_plock[NPLOCK];
 static unsigned long   g_comp_enospc;
-static unsigned long   g_pages_lz4, g_pages_raw, g_pages_same;
+static unsigned long   g_pages_compressed, g_pages_raw, g_pages_same;
 static uint64_t        g_vram_obj_bytes;   /* allocated object bytes, under g_alloc_lock */
 
 static __thread char *t_cstage;
@@ -586,7 +640,7 @@ static int load_liblz4(void)
         }
     }
     if (!g_liblz4) {
-        fprintf(stderr, "[nbd-vram] VRAM_COMPRESS=1 but cannot load liblz4.so.1 - install liblz4-1 (Debian) or lz4-libs (Fedora)\n");
+        fprintf(stderr, "[nbd-vram] lz4 selected but cannot load liblz4.so.1 - install liblz4-1 (Debian) or lz4-libs (Fedora)\n");
         return -1;
     }
     _LZ4_compress_default = (pfn_LZ4_compress_default)dlsym(g_liblz4, "LZ4_compress_default");
@@ -596,6 +650,68 @@ static int load_liblz4(void)
         return -1;
     }
     return 0;
+}
+
+static int load_libzstd(void)
+{
+    g_libzstd = dlopen("libzstd.so.1", RTLD_NOW);
+    if (!g_libzstd) {
+        fprintf(stderr, "[nbd-vram] zstd selected but cannot load libzstd.so.1 - install libzstd1 (Debian) or libzstd (Fedora)\n");
+        return -1;
+    }
+    LOAD_SYM(g_libzstd, "ZSTD_createCCtx", _ZSTD_createCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_createDCtx", _ZSTD_createDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_freeCCtx", _ZSTD_freeCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_freeDCtx", _ZSTD_freeDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_compressCCtx", _ZSTD_compressCCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_decompressDCtx", _ZSTD_decompressDCtx);
+    LOAD_SYM(g_libzstd, "ZSTD_isError", _ZSTD_isError);
+    LOAD_SYM(g_libzstd, "ZSTD_maxCLevel", _ZSTD_maxCLevel);
+    if (g_compress_level > _ZSTD_maxCLevel()) {
+        fprintf(stderr, "[nbd-vram] zstd level %d exceeds this library's maximum %d\n",
+                g_compress_level, _ZSTD_maxCLevel());
+        return -1;
+    }
+    /* Allocate and warm one context pair per worker before advertising readiness.
+     * All requests use fixed 4K pages, so the workspace can be reused under swap
+     * pressure without creating a new context for every page. */
+    char plain[COMP_PAGE] = {0}, packed[2 * COMP_PAGE];
+    for (int i = 0; i < g_nbd_threads; i++) {
+        g_zstd_cctx[i] = _ZSTD_createCCtx();
+        g_zstd_dctx[i] = _ZSTD_createDCtx();
+        if (!g_zstd_cctx[i] || !g_zstd_dctx[i]) {
+            fprintf(stderr, "[nbd-vram] zstd context allocation failed\n");
+            return -1;
+        }
+        size_t n = _ZSTD_compressCCtx(g_zstd_cctx[i], packed, sizeof(packed),
+                                    plain, sizeof(plain), g_compress_level);
+        if (_ZSTD_isError(n) ||
+            _ZSTD_decompressDCtx(g_zstd_dctx[i], plain, sizeof(plain), packed, n) != COMP_PAGE) {
+            fprintf(stderr, "[nbd-vram] zstd context initialization failed\n");
+            return -1;
+        }
+    }
+    printf("[nbd-vram] loaded libzstd.so.1 (level %d)\n", g_compress_level);
+    return 0;
+}
+
+/* A zero result means store the original page instead (including codec errors).
+ * The codec is fixed for the lifetime of the store, so PTEs need no codec tag. */
+static int compress_page(const char *src, char *dst)
+{
+    if (g_compress == COMP_ZSTD) {
+        size_t n = _ZSTD_compressCCtx(t_zstd_cctx, dst, COMP_PAGE - 1,
+                                    src, COMP_PAGE, g_compress_level);
+        return _ZSTD_isError(n) ? 0 : (int)n;
+    }
+    return _LZ4_compress_default(src, dst, COMP_PAGE, COMP_PAGE - 1);
+}
+
+static int decompress_page(const char *src, char *dst, uint16_t len)
+{
+    if (g_compress == COMP_ZSTD)
+        return _ZSTD_decompressDCtx(t_zstd_dctx, dst, COMP_PAGE, src, len) == COMP_PAGE;
+    return _LZ4_decompress_safe(src, dst, len, COMP_PAGE) == COMP_PAGE;
 }
 
 static inline void lock_page(uint64_t pg)   { pthread_mutex_lock(&g_plock[pg % NPLOCK]); }
@@ -761,11 +877,11 @@ static uint32_t load_plain(uint64_t pg, char *dst, CUstream stream)
             return EIO;
         _cuStreamSynchronize(stream);
         return 0;
-    case PTE_LZ4:
+    case PTE_COMPRESSED:
         if (_cuMemcpyDtoHAsync(t_cstage, g_vram_ptr + e.vram_off, e.clen, stream) != CUDA_SUCCESS)
             return EIO;
         _cuStreamSynchronize(stream);
-        if (_LZ4_decompress_safe(t_cstage, dst, e.clen, COMP_PAGE) != COMP_PAGE)
+        if (!decompress_page(t_cstage, dst, e.clen))
             return EIO;
         return 0;
     default:
@@ -791,14 +907,14 @@ static void prepare_plain(uint64_t pg, const char *plain, int slot, struct cpend
         return;
     }
     char *slotp = t_cstage + (size_t)slot * COMP_PAGE;
-    int csz = _LZ4_compress_default(plain, slotp, COMP_PAGE, COMP_PAGE - 1);
+    int csz = compress_page(plain, slotp);
     if (csz <= 0) {
         memcpy(slotp, plain, COMP_PAGE);
         op->kind  = PTE_RAW;
         op->clen  = COMP_PAGE;
         op->klass = (uint8_t)class_for(COMP_PAGE);
     } else {
-        op->kind  = PTE_LZ4;
+        op->kind  = PTE_COMPRESSED;
         op->clen  = (uint16_t)csz;
         op->klass = (uint8_t)class_for((uint32_t)csz);
     }
@@ -808,7 +924,7 @@ static void pte_kind_add(uint8_t kind, int delta)
 {
     unsigned long *p = NULL;
     switch (kind) {
-    case PTE_LZ4:  p = &g_pages_lz4;  break;
+    case PTE_COMPRESSED:  p = &g_pages_compressed;  break;
     case PTE_RAW:  p = &g_pages_raw;  break;
     case PTE_SAME: p = &g_pages_same; break;
     default: return;
@@ -827,7 +943,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
     pthread_mutex_lock(&g_alloc_lock);
     int failed = -1;
     for (int i = 0; i < n; i++) {
-        if (ops[i].kind != PTE_LZ4 && ops[i].kind != PTE_RAW)
+        if (ops[i].kind != PTE_COMPRESSED && ops[i].kind != PTE_RAW)
             continue;
         uint64_t off = pool_alloc(ops[i].klass);
         if (off == UINT64_MAX) { failed = i; break; }
@@ -835,7 +951,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
     }
     if (failed >= 0) {
         for (int i = 0; i < failed; i++) {
-            if (ops[i].kind == PTE_LZ4 || ops[i].kind == PTE_RAW)
+            if (ops[i].kind == PTE_COMPRESSED || ops[i].kind == PTE_RAW)
                 pool_free(ops[i].new_off, ops[i].klass);
         }
         pthread_mutex_unlock(&g_alloc_lock);
@@ -848,7 +964,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
     pthread_mutex_unlock(&g_alloc_lock);
 
     for (int i = 0; i < n; i++) {
-        if (ops[i].kind != PTE_LZ4 && ops[i].kind != PTE_RAW)
+        if (ops[i].kind != PTE_COMPRESSED && ops[i].kind != PTE_RAW)
             continue;
         size_t nbytes = (ops[i].kind == PTE_RAW) ? COMP_PAGE : ops[i].clen;
         CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + ops[i].new_off,
@@ -857,7 +973,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
         if (r != CUDA_SUCCESS) {
             pthread_mutex_lock(&g_alloc_lock);
             for (int j = 0; j < n; j++) {
-                if (ops[j].kind == PTE_LZ4 || ops[j].kind == PTE_RAW)
+                if (ops[j].kind == PTE_COMPRESSED || ops[j].kind == PTE_RAW)
                     pool_free(ops[j].new_off, ops[j].klass);
             }
             pthread_mutex_unlock(&g_alloc_lock);
@@ -870,7 +986,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
 
     pthread_mutex_lock(&g_alloc_lock);
     for (int i = 0; i < n; i++) {
-        if (ops[i].old_kind == PTE_LZ4 || ops[i].old_kind == PTE_RAW)
+        if (ops[i].old_kind == PTE_COMPRESSED || ops[i].old_kind == PTE_RAW)
             pool_free(ops[i].old_off, ops[i].old_klass);
     }
     pthread_mutex_unlock(&g_alloc_lock);
@@ -961,7 +1077,7 @@ static uint32_t rpend_commit(struct rpend *ops, int n, char *buf, CUstream strea
         char *src = t_cstage + (size_t)ops[i].slot * COMP_PAGE;
         if (ops[i].kind == PTE_RAW) {
             memcpy(dst, src, COMP_PAGE);
-        } else if (_LZ4_decompress_safe(src, dst, ops[i].clen, COMP_PAGE) != COMP_PAGE) {
+        } else if (!decompress_page(src, dst, ops[i].clen)) {
             for (int j = i; j < n; j++)
                 unlock_page(ops[j].pg);
             return EIO;
@@ -1050,7 +1166,7 @@ static uint32_t comp_trim(uint64_t offset, uint32_t len, CUstream stream)
         memset(&g_ptes[pg], 0, sizeof(g_ptes[pg]));
         unlock_page(pg);
         pte_kind_add(old.kind, -1);
-        if (old.kind == PTE_LZ4 || old.kind == PTE_RAW) {
+        if (old.kind == PTE_COMPRESSED || old.kind == PTE_RAW) {
             pthread_mutex_lock(&g_alloc_lock);
             pool_free(old.vram_off, old.klass);
             pthread_mutex_unlock(&g_alloc_lock);
@@ -1068,7 +1184,7 @@ static void compress_status_write(void)
     obj_bytes  = g_vram_obj_bytes;
     pthread_mutex_unlock(&g_alloc_lock);
 
-    unsigned long lz4  = g_pages_lz4;
+    unsigned long compressed = g_pages_compressed;
     unsigned long raw  = g_pages_raw;
     unsigned long same = g_pages_same;
     char buf[768];
@@ -1076,6 +1192,8 @@ static void compress_status_write(void)
     int cfg_frac  = g_compress_ratio_tenths % 10;
     int n = snprintf(buf, sizeof(buf),
         "compress=1\n"
+        "algorithm=%s\n"
+        "compression_level=%d\n"
         "configured_ratio=%d.%d\n"
         "configured_ratio_tenths=%d\n"
         "vram_bytes=%llu\n"
@@ -1083,15 +1201,18 @@ static void compress_status_write(void)
         "vram_slab_bytes=%llu\n"
         "vram_obj_bytes=%llu\n"
         "pages_lz4=%lu\n"
+        "pages_zstd=%lu\n"
         "pages_raw=%lu\n"
         "pages_same=%lu\n"
         "enospc=%lu\n",
+        compression_name(), g_compress == COMP_ZSTD ? g_compress_level : 0,
         cfg_whole, cfg_frac, g_compress_ratio_tenths,
         (unsigned long long)g_vram_size,
         (unsigned long long)g_export_size,
         (unsigned long long)slabs_used * SLAB_SZ,
         (unsigned long long)obj_bytes,
-        lz4, raw, same, g_comp_enospc);
+        g_compress == COMP_LZ4 ? compressed : 0,
+        g_compress == COMP_ZSTD ? compressed : 0, raw, same, g_comp_enospc);
     if (n <= 0 || n >= (int)sizeof(buf)) return;
 
     int fd = open(STATUS_TMP, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -1120,11 +1241,14 @@ static void *status_worker(void *arg)
 
 static int compress_init(void)
 {
-    if (load_liblz4() != 0) return -1;
+    if ((g_compress == COMP_ZSTD ? load_libzstd() : load_liblz4()) != 0) return -1;
     if (g_vram_size < SLAB_SZ || (g_vram_size % SLAB_SZ) != 0) {
         fprintf(stderr, "[nbd-vram] VRAM size not aligned to %u KiB slabs\n", SLAB_SZ / 1024);
         return -1;
     }
+    /* Fractional ratios can leave a partial page. Do not advertise bytes beyond
+     * the last PTE; even a sector-aligned access there would overrun the table. */
+    g_export_size = (g_export_size / COMP_PAGE) * COMP_PAGE;
     g_npages = g_export_size / COMP_PAGE;
     g_ptes = calloc(g_npages, sizeof(*g_ptes));
     if (!g_ptes) { perror("calloc ptes"); return -1; }
@@ -1158,6 +1282,13 @@ static void compress_shutdown(void)
     free(g_chunk_owner); g_chunk_owner = NULL;
     free(g_chunk_busy);  g_chunk_busy  = NULL;
     if (g_liblz4) { dlclose(g_liblz4); g_liblz4 = NULL; }
+    for (int i = 0; i < g_nbd_threads; i++) {
+        if (g_zstd_cctx[i]) _ZSTD_freeCCtx(g_zstd_cctx[i]);
+        if (g_zstd_dctx[i]) _ZSTD_freeDCtx(g_zstd_dctx[i]);
+        g_zstd_cctx[i] = NULL;
+        g_zstd_dctx[i] = NULL;
+    }
+    if (g_libzstd) { dlclose(g_libzstd); g_libzstd = NULL; }
 }
 
 /* Read a full 28-byte request header WITHOUT blocking if none is queued. The
@@ -1412,6 +1543,8 @@ static void *thread_worker(void *arg)
         _cuMemAllocHost(&batchbuf, (size_t)g_batch_depth * BATCH_SLOT);
     t_cstage = NULL;
     t_cstage_cuda = 0;
+    t_zstd_cctx = g_zstd_cctx[idx];
+    t_zstd_dctx = g_zstd_dctx[idx];
     if (g_compress) {
         if (_cuMemAllocHost((void **)&t_cstage, (size_t)COMP_BATCH * COMP_PAGE) == CUDA_SUCCESS) {
             t_cstage_cuda = 1;
@@ -1474,6 +1607,12 @@ int main(void)
 {
     CUdevice  cu_dev;
     int       ret    = 1;
+
+    const char *cenv = getenv("VRAM_COMPRESS");
+    if (parse_compression(cenv, &g_compress, &g_compress_level) != 0) {
+        fprintf(stderr, "[nbd-vram] invalid VRAM_COMPRESS='%s' (expected 0, 1, lz4, zstd, or zstd:LEVEL with LEVEL 1..22)\n", cenv);
+        return 1;
+    }
 
     /* Socket path is fixed in production; VRAM_SOCK_PATH overrides it for
      * non-root testing. Resolved early so every cleanup path sees it. */
@@ -1540,8 +1679,6 @@ int main(void)
         }
         const char *bgenv = getenv("VRAM_BATCH_DEBUG");
         if (bgenv) g_batch_debug = atoi(bgenv) != 0;
-        const char *cenv = getenv("VRAM_COMPRESS");
-        if (cenv) g_compress = atoi(cenv) != 0;
         const char *renv = getenv("VRAM_COMPRESS_RATIO");
         if (renv && parse_ratio_tenths(renv, &g_compress_ratio_tenths) != 0) {
             fprintf(stderr, "[nbd-vram] invalid VRAM_COMPRESS_RATIO='%s' (expected 1.0..8.0, one decimal)\n", renv);
@@ -1575,8 +1712,8 @@ int main(void)
     if (g_compress) {
         g_export_size = (g_vram_size * (uint64_t)g_compress_ratio_tenths) / 10ULL;
         if (compress_init() != 0) goto out_cuda;
-        printf("[nbd-vram] compression: lz4 on (ratio %.1fx, %llu MiB VRAM advertised as %llu MiB swap, %llu pages)\n",
-               (double)g_compress_ratio_tenths / 10.0,
+        printf("[nbd-vram] compression: %s on (ratio %.1fx, %llu MiB VRAM advertised as %llu MiB swap, %llu pages)\n",
+               compression_name(), (double)g_compress_ratio_tenths / 10.0,
                (unsigned long long)(g_vram_size >> 20),
                (unsigned long long)(g_export_size >> 20),
                (unsigned long long)g_npages);

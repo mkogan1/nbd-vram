@@ -46,7 +46,7 @@ fi
 echo "$NBD_DEV" > /run/nbd-vram-dev
 SIZE_MIB=$(( $(blockdev --getsize64 "$NBD_DEV") / 1024 / 1024 ))
 if [ "${VRAM_COMPRESS:-0}" != "0" ]; then
-    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, lz4 compression on, ratio ${VRAM_COMPRESS_RATIO:-2.0}x, discard=pages)"
+    echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, ${VRAM_COMPRESS} compression on, ratio ${VRAM_COMPRESS_RATIO:-2.0}x, discard=pages)"
 else
     echo "nbd-vram-connect: swap active on $NBD_DEV (${SIZE_MIB} MiB, compression off)"
 fi

@@ -1,6 +1,6 @@
 #!/bin/sh
-# nbd-vram-compression-status.sh - show live lz4 compression ratio for VRAM swap
-# Reads /run/nbd-vram.status (updated ~1s by the daemon when VRAM_COMPRESS=1).
+# nbd-vram-compression-status.sh - show live compression codec, level and ratio for VRAM swap
+# Reads /run/nbd-vram.status (updated ~1s by the daemon when compression is enabled).
 
 STATUS=/run/nbd-vram.status
 
@@ -14,7 +14,7 @@ mib() {
 if [ ! -f "$STATUS" ]; then
     if [ -S /run/nbd-vram.sock ] || pgrep -x nbd-vram >/dev/null 2>&1; then
         echo "nbd-vram is running without compression (VRAM_COMPRESS=0)."
-        echo "Set VRAM_COMPRESS=1 to pack pages in VRAM and see a live ratio here."
+        echo "Set VRAM_COMPRESS=lz4 or zstd:3 to pack pages in VRAM and see a live ratio here."
         echo ""
         swapon --show 2>/dev/null || true
         exit 0
@@ -29,6 +29,8 @@ if [ "$compress" != "1" ]; then
     exit 0
 fi
 
+algorithm=$(kv algorithm)
+level=$(kv compression_level)
 cfg=$(kv configured_ratio)
 cfg10=$(kv configured_ratio_tenths)
 vram_bytes=$(kv vram_bytes)
@@ -36,10 +38,13 @@ export_bytes=$(kv export_bytes)
 slab_bytes=$(kv vram_slab_bytes)
 obj_bytes=$(kv vram_obj_bytes)
 lz4=$(kv pages_lz4)
+zstd=$(kv pages_zstd)
 raw=$(kv pages_raw)
 same=$(kv pages_same)
 enospc=$(kv enospc)
 
+algorithm=${algorithm:-lz4}
+level=${level:-0}
 cfg=${cfg:-0}
 cfg10=${cfg10:-0}
 vram_bytes=${vram_bytes:-0}
@@ -47,13 +52,14 @@ export_bytes=${export_bytes:-0}
 slab_bytes=${slab_bytes:-0}
 obj_bytes=${obj_bytes:-0}
 lz4=${lz4:-0}
+zstd=${zstd:-0}
 raw=${raw:-0}
 same=${same:-0}
 enospc=${enospc:-0}
 
-pages=$(( lz4 + raw + same ))
+pages=$(( lz4 + zstd + raw + same ))
 stored_bytes=$(( pages * 4096 ))
-payload=$(( lz4 + raw ))
+payload=$(( lz4 + zstd + raw ))
 
 vram_mib=$(mib "$vram_bytes")
 export_mib=$(mib "$export_bytes")
@@ -77,6 +83,11 @@ fi
 
 echo "nbd-vram compression"
 echo ""
+if [ "$algorithm" = "zstd" ]; then
+    echo "  codec            : zstd:${level}"
+else
+    echo "  codec            : ${algorithm}"
+fi
 echo "  configured ratio : ${cfg}x   (${export_mib} MiB swap on ${vram_mib} MiB VRAM)"
 if [ "$eff" = "inf" ]; then
     echo "  effective ratio  : infinite   (${stored_mib} MiB stored, 0 MiB VRAM used)"
@@ -86,7 +97,7 @@ fi
 echo "  VRAM pool        : ${slab_mib} / ${vram_mib} MiB  (${pool_pct}% full)"
 echo "  packed objects   : ${obj_mib} MiB  (size-class occupancy inside those slabs)"
 echo "  swap device      : ${stored_mib} / ${export_mib} MiB stored  (${logical_pct}% of advertised size)"
-echo "  pages            : ${pages}  (lz4 ${lz4}, uncompressed ${raw}, same-filled ${same})"
+echo "  pages            : ${pages}  (lz4 ${lz4}, zstd ${zstd}, uncompressed ${raw}, same-filled ${same})"
 echo "  ENOSPC writes    : ${enospc}"
 echo ""
 

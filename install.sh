@@ -17,7 +17,7 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Remember previously-installed knobs so a reinstall can default to them
 PREV_ALLOC=$(grep -oE 'VRAM_SETUP_SIZE_MB=[0-9]+' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | grep -oE '[0-9]+$' || true)
-PREV_COMPRESS=$(sed -n 's/^Environment=VRAM_COMPRESS=\([0-9][0-9]*\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
+PREV_COMPRESS=$(sed -n 's/^Environment=VRAM_COMPRESS=\([^[:space:]]*\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 PREV_RATIO=$(sed -n 's/^Environment=VRAM_COMPRESS_RATIO=\([0-9]\+\(\.[0-9]\)\?\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 
 echo "=== nbd-vram installer ==="
@@ -118,10 +118,14 @@ if [ -t 0 ]; then
     # VRAM - leaving too little crashes Xorg on a cold boot. The display server's
     # need is roughly fixed (a couple of GiB), not proportional to card size, so
     # leave a fixed headroom: ~1 GiB for an offload-only card, ~3 GiB for one that
-    # renders the desktop. This doubles as the hard cap the prompt enforces below.
+    # renders the desktop. These are recommendations; the prompt allows leaving
+    # as little as 1 GiB, including 3072 MiB of swap on a 4096 MiB GPU.
     DISP=$(nvidia-smi --query-gpu=display_active --format=csv,noheader 2>/dev/null | head -1 | tr -d ' ')
     REC=""
+    CAP=""
     if [ -n "$TOTAL_VRAM" ]; then
+        CAP=$(( TOTAL_VRAM - 1024 ))
+        [ "$CAP" -lt 1024 ] && CAP=1024
         if [ "$DISP" = "Disabled" ]; then
             REC=$(( TOTAL_VRAM - 1024 ))   # offload-only: leave ~1 GiB for the display server's init
         else
@@ -130,7 +134,6 @@ if [ -t 0 ]; then
         # too small to leave safe headroom AND still dedicate the 1024 minimum
         [ "$REC" -lt 1024 ] && { REC=1024; SMALL=1; }
     fi
-    CAP="$REC"   # hard cap for the prompt = the safe recommendation for this card
     # default to the previous value only if it is within the cap, else the recommendation
     if [ -n "$PREV_ALLOC" ] && { [ -z "$CAP" ] || [ "$PREV_ALLOC" -le "$CAP" ]; }; then
         DEF="$PREV_ALLOC"
@@ -141,8 +144,8 @@ if [ -t 0 ]; then
     if [ -n "$REC" ]; then
         echo "Your GPU reports ${TOTAL_VRAM} MiB of VRAM."
         [ -n "${SMALL:-}" ] && echo "Note: this GPU is small; dedicating VRAM may leave too little for the display."
-        echo "Recommended and maximum: ${REC} MiB. Pick less for more headroom. Modify"
-        echo "VRAM_SETUP_SIZE_MB in the service file at your own risk to allocate more."
+        echo "Recommended: ${REC} MiB. Maximum: ${CAP} MiB."
+        echo "Pick less to leave more VRAM for the display and GPU applications."
     fi
     while :; do
         printf "VRAM to allocate for swap, in MiB [%s]: " "$DEF"
@@ -153,7 +156,7 @@ if [ -t 0 ]; then
         esac
         if [ "$ALLOC" -lt 1024 ]; then echo "  too small (minimum 1024 MiB)"; continue; fi
         if [ -n "$CAP" ] && [ "$ALLOC" -gt "$CAP" ]; then
-            echo "  too high - the safe maximum here is ${CAP} MiB, to leave the display server its VRAM"
+            echo "  too high - the maximum here is ${CAP} MiB, reserving VRAM for the GPU"
             continue
         fi
         break
@@ -162,27 +165,27 @@ if [ -t 0 ]; then
     echo "      VRAM allocation set to ${ALLOC} MiB"
 
     echo ""
-    echo "lz4 compression packs swap pages in VRAM so the swap device can be larger"
-    echo "than the CUDA allocation (default 2.0x). Needs liblz4. Slightly more CPU per fault."
-    if [ "${PREV_COMPRESS:-0}" = "1" ]; then
-        printf "Enable lz4 compression of VRAM swap? [Y/n]: "
-        read -r COMP_REPLY || COMP_REPLY=""
-        if [ "$COMP_REPLY" = "n" ] || [ "$COMP_REPLY" = "N" ]; then
-            COMPRESS=0
-        else
-            COMPRESS=1
-        fi
-    else
-        printf "Enable lz4 compression of VRAM swap? [y/N]: "
-        read -r COMP_REPLY || COMP_REPLY=""
-        if [ "$COMP_REPLY" = "y" ] || [ "$COMP_REPLY" = "Y" ]; then
-            COMPRESS=1
-        else
-            COMPRESS=0
-        fi
-    fi
+    echo "Compression packs swap pages in VRAM so the swap device can be larger"
+    echo "than the CUDA allocation (default 2.0x). Choose lz4 or zstd:LEVEL (1-22)."
+    echo "Higher zstd levels use more CPU; zstd defaults to level 3."
+    COMPRESS_DEFAULT=${PREV_COMPRESS:-off}
+    case "$COMPRESS_DEFAULT" in
+        0) COMPRESS_DEFAULT=off ;;
+        1) COMPRESS_DEFAULT=lz4 ;;
+    esac
+    while :; do
+        printf "Compression (off, lz4, zstd, zstd:1..22) [%s]: " "$COMPRESS_DEFAULT"
+        read -r COMPRESS || COMPRESS=""
+        COMPRESS=${COMPRESS:-$COMPRESS_DEFAULT}
+        case "$COMPRESS" in
+            off|0) COMPRESS=0; break ;;
+            1) COMPRESS=lz4; break ;;
+            lz4|zstd|zstd:[1-9]|zstd:1[0-9]|zstd:2[0-2]) break ;;
+            *) echo "  please enter off, lz4, zstd, or zstd:LEVEL with a level from 1 to 22" ;;
+        esac
+    done
     RATIO=${PREV_RATIO:-2.0}
-    if [ "$COMPRESS" = "1" ]; then
+    if [ "$COMPRESS" != "0" ]; then
         while :; do
             printf "Compression ratio (logical size / VRAM, 1.0-8.0, one decimal) [%s]: " "$RATIO"
             read -r RATIO_REPLY || RATIO_REPLY=""
@@ -202,25 +205,29 @@ if [ -t 0 ]; then
             RATIO=$RATIO_REPLY
             break
         done
-        if ! ldconfig -p 2>/dev/null | grep -q 'liblz4.so.1'; then
-            echo "      installing liblz4 (needed for VRAM_COMPRESS=1)..."
-            apt-get install -y liblz4-1 || {
-                echo "      warning: could not install liblz4-1; the service will fail to start until liblz4.so.1 is present" >&2
+        case "$COMPRESS" in
+            zstd*) CODEC_LIB=libzstd.so.1; CODEC_PACKAGE=libzstd1 ;;
+            *)     CODEC_LIB=liblz4.so.1; CODEC_PACKAGE=liblz4-1 ;;
+        esac
+        if ! ldconfig -p 2>/dev/null | grep -qF "$CODEC_LIB"; then
+            echo "      installing ${CODEC_PACKAGE} (needed for VRAM_COMPRESS=${COMPRESS})..."
+            apt-get install -y "$CODEC_PACKAGE" || {
+                echo "      warning: could not install ${CODEC_PACKAGE}; the service will fail to start until ${CODEC_LIB} is present" >&2
             }
         fi
     fi
-    sed -i "s/^Environment=VRAM_COMPRESS=[0-9][0-9]*/Environment=VRAM_COMPRESS=${COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
+    sed -i "s/^Environment=VRAM_COMPRESS=.*/Environment=VRAM_COMPRESS=${COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
     sed -i "s/^Environment=VRAM_COMPRESS_RATIO=[0-9]\+\(\.[0-9]\)\?/Environment=VRAM_COMPRESS_RATIO=${RATIO}/" /etc/systemd/system/vram-swap-nbd.service
-    if [ "$COMPRESS" = "1" ]; then
+    if [ "$COMPRESS" != "0" ]; then
         EXPORT_MIB=$(awk -v a="$ALLOC" -v r="$RATIO" 'BEGIN { printf "%d", a * r }')
-        echo "      lz4 compression on, ratio ${RATIO} (${ALLOC} MiB VRAM -> ${EXPORT_MIB} MiB swap)"
+        echo "      ${COMPRESS} compression on, ratio ${RATIO} (${ALLOC} MiB VRAM -> ${EXPORT_MIB} MiB swap)"
     else
-        echo "      lz4 compression off (1:1 VRAM mapping)"
+        echo "      compression off (1:1 VRAM mapping)"
     fi
 else
     # Non-interactive reinstall: keep previous compress knobs if present
     if [ -n "$PREV_COMPRESS" ]; then
-        sed -i "s/^Environment=VRAM_COMPRESS=[0-9][0-9]*/Environment=VRAM_COMPRESS=${PREV_COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
+        sed -i "s/^Environment=VRAM_COMPRESS=.*/Environment=VRAM_COMPRESS=${PREV_COMPRESS}/" /etc/systemd/system/vram-swap-nbd.service
     fi
     if [ -n "$PREV_RATIO" ]; then
         sed -i "s/^Environment=VRAM_COMPRESS_RATIO=[0-9]\+\(\.[0-9]\)\?/Environment=VRAM_COMPRESS_RATIO=${PREV_RATIO}/" /etc/systemd/system/vram-swap-nbd.service
