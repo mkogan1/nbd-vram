@@ -1,9 +1,5 @@
 /* CPU-only storage regression tests: real codecs, host memory in place of CUDA. */
-#define main daemon_main
-#define STATUS_PATH "nbd-vram.status"
-#include "nbd-vram.c"
-#undef main
-#include <assert.h>
+#include "test-metadata.h"
 
 static CUresult copy_to_device(CUdeviceptr dst, const void *src, size_t n, CUstream stream)
 {
@@ -60,6 +56,7 @@ static void *concurrent_roundtrip(void *arg)
 {
     int idx = (int)(intptr_t)arg;
     init_worker(idx);
+    metadata_heap_forbidden = 1;
     char in[COMP_PAGE], out[COMP_PAGE];
     uint64_t offset = (uint64_t)idx * COMP_PAGE;
     for (int pass = 0; pass < 32; pass++) {
@@ -94,6 +91,7 @@ int main(int argc, char **argv)
     assert(oob(g_export_size, 1));
     assert(g_compress == COMP_ZSTD ? !g_liblz4 : !g_libzstd);
     init_worker(0);
+    metadata_heap_forbidden = 1;
     char last[COMP_PAGE];
     memset(last, 0xab, sizeof(last));
     assert(comp_write(g_export_size - COMP_PAGE, last, sizeof(last), NULL) == 0);
@@ -161,6 +159,22 @@ int main(int argc, char **argv)
     assert(comp_write(0, raw, COMP_PAGE, NULL) == ENOSPC);
     assert(comp_read(0, out, COMP_PAGE, NULL) == 0 && memcmp(raw, out, COMP_PAGE) == 0);
     assert(comp_trim(COMP_PAGE, COMP_PAGE, NULL) == 0);
+
+    /* No unused slabs remain, but a raw slot can hold a compressed page. A
+     * two-page batch must roll back its borrowed slot if the second won't fit. */
+    char packed[2 * COMP_PAGE];
+    for (int i = 0; i < (int)sizeof(packed); i++) packed[i] = (char)(i % 71);
+    uint64_t used = g_vram_obj_bytes;
+    assert(comp_write(g_vram_size, packed, sizeof(packed), NULL) == ENOSPC);
+    assert(g_vram_obj_bytes == used && g_ptes[g_vram_size / COMP_PAGE].kind == PTE_NONE);
+    assert(comp_write(g_vram_size, packed, COMP_PAGE, NULL) == 0);
+    struct pte borrowed = g_ptes[g_vram_size / COMP_PAGE];
+    assert(borrowed.kind == PTE_COMPRESSED && borrowed.clen < COMP_PAGE);
+    assert(borrowed.klass == class_for(COMP_PAGE));
+    assert(g_vram_obj_bytes == used + COMP_PAGE);
+    assert(comp_read(g_vram_size, out, COMP_PAGE, NULL) == 0 && memcmp(packed, out, COMP_PAGE) == 0);
+    assert(comp_trim(g_vram_size, COMP_PAGE, NULL) == 0);
+    assert(g_vram_obj_bytes == used);
     assert(comp_write(g_vram_size, raw, COMP_PAGE, NULL) == 0);
     assert(comp_trim(0, g_export_size, NULL) == 0);
 
@@ -171,7 +185,9 @@ int main(int argc, char **argv)
     assert(g_nfree_chunks == g_nchunks && g_pages_compressed == 0);
 
     free(t_cstage);
+    metadata_heap_forbidden = 0;
     compress_shutdown();
+    assert(metadata_live_allocations == 0);
     free((void *)(uintptr_t)g_vram_ptr);
     assert(chdir("/") == 0 && rmdir(tmp) == 0);
     printf("PASS %s: parser, roundtrip, partial I/O, TRIM, corruption, ENOSPC, concurrency, status\n", argv[1]);

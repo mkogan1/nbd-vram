@@ -114,6 +114,8 @@ Environment=VRAM_COMPRESS_RATIO=2.0
 
 When compression or deduplication is on, `swapon --discard=pages` is used so freed swap slots TRIM and return VRAM to the pool. Without discard the pool would leak until those offsets are overwritten.
 
+The packed store reserves and touches its page table, slab records, and slot bitmaps at startup. Slab metadata uses about 4.3 MiB of system RAM per GiB of VRAM; creating or recycling slabs during I/O does not allocate host memory. Each size class keeps a list of slabs with free slots. If its own slots and all unused slabs are exhausted, a page can use a free slot from a larger class before returning `ENOSPC`. Accounting and TRIM use the actual slot size. This fallback helps with fragmentation but cannot combine smaller holes into a larger slot.
+
 Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows the codec and level, configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
@@ -137,10 +139,12 @@ A hash finds candidates, then the daemon reads the candidate from VRAM and compa
 - **deduped pages**: current extra copies avoided. Three pages sharing one payload count as two deduped pages. This is a subset of the existing page totals, not an additional page type.
 - **dedup savings**: object-slot bytes avoided after compression, including size-class rounding. This does not imply the same number of whole slabs became free.
 - **dedup matches**: successful page writes that reused an existing payload since startup, including rewriting a page with identical contents. Failed batches do not increase this counter.
-- **dedup index RAM**: memory for the lookup table, per-page references, and unique-payload records (excluding allocator overhead).
+- **dedup index RAM**: reserved memory for the lookup table, per-page references, and the entire payload-record pool, including unused records (excluding allocator overhead).
 - **dedup net savings**: VRAM object storage saved minus system RAM used by the index, displayed in MiB. Can be negative when the index costs more than deduplication saves.
 
-Deduplication adds CPU hashing, VRAM reads to verify candidates, and host RAM metadata. Dedup write commits are serialized while verifying and updating references; ordinary reads still run in parallel. These costs can reduce throughput, so enable it when repeated pages save enough space. On 64-bit systems, the index uses 8 bytes per logical page, 48 bytes per unique payload, and a hash table of up to 8 MiB; this memory is covered by the daemon's existing memory locking.
+Deduplication adds CPU hashing, VRAM reads to verify candidates, and host RAM metadata. Dedup write commits are serialized while verifying and updating references; ordinary reads still run in parallel. These costs can reduce throughput, so enable it when repeated pages save enough space.
+
+On 64-bit systems, the index reserves 8 bytes per logical page, a hash table of up to 8 MiB, and 48 bytes per payload object in a pool allocated at startup. The pool holds at most one object per logical page plus 32 pending replacements, capped by the number of payloads that can physically fit in VRAM (4096-byte slots without compression, 32-byte slots with compression). Objects return to this pool on TRIM, overwrite, or rollback; writes do not allocate or free dedup metadata from the host heap. The startup log and `dedup index RAM` status report the full reservation, including unused objects. This moves the RAM cost to startup, where allocation failure prevents the daemon from starting, and the existing memory locking keeps the metadata resident.
 
 ---
 
@@ -178,13 +182,13 @@ This is the natural trade-off of swapping to VRAM: it is free memory, right up u
 
 ## Smoke test (without installing)
 
-CPU-only compression and deduplication regression tests (requires both runtime codec libraries and Python 3):
+CPU-only allocator, compression, and deduplication regression tests (requires both runtime codec libraries and Python 3):
 
 ```sh
 make test
 ```
 
-These use simulated VRAM and do not activate swap. For the GPU/NBD smoke test:
+These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. For the GPU/NBD smoke test:
 
 ```sh
 sudo bash test-nbd.sh

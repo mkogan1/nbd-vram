@@ -550,6 +550,8 @@ static const uint16_t k_class_sz[] = {
     512, 640, 768, 896, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096
 };
 #define NCLASS ((int)(sizeof(k_class_sz) / sizeof(k_class_sz[0])))
+#define SLAB_NONE UINT32_MAX
+#define SLAB_BITMAP_BYTES ((SLAB_SZ / 32 + 7) / 8)
 
 struct pte {
     uint64_t vram_off;
@@ -561,17 +563,12 @@ struct pte {
 
 struct slab {
     uint32_t chunk;
-    uint32_t idx;     /* index in g_cls[klass].slabs */
+    uint32_t next, prev; /* partial-class list; next also links unused slabs */
     uint16_t nobj;
     uint16_t nfree;
     uint16_t hint;
     uint8_t  klass;
-    uint8_t *bm;      /* 1 = in use */
-};
-
-struct szclass {
-    struct slab **slabs;
-    uint32_t n, cap;
+    uint8_t bm[SLAB_BITMAP_BYTES]; /* sized for the smallest class; 1 = in use */
 };
 
 struct cpend {
@@ -619,10 +616,9 @@ static __thread ZSTD_DCtx *t_zstd_dctx;
 
 static struct pte     *g_ptes;
 static uint64_t        g_npages;
-static struct szclass  g_cls[NCLASS];
-static struct slab   **g_chunk_owner;
-static uint8_t        *g_chunk_busy;
-static uint32_t        g_nchunks, g_nfree_chunks, g_chunk_hint;
+static struct slab    *g_slabs;
+static uint32_t        g_class_head[NCLASS];
+static uint32_t        g_nchunks, g_nfree_chunks, g_free_chunk = SLAB_NONE;
 static pthread_mutex_t g_alloc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_plock[NPLOCK];
 static unsigned long   g_comp_enospc;
@@ -641,10 +637,19 @@ struct dedup_obj {
     uint8_t kind, klass;
 };
 static struct dedup_obj **g_dedup_index, **g_dedup_ptes;
+static struct dedup_obj *g_dedup_objects, *g_dedup_free;
+static size_t g_dedup_capacity;
 static size_t g_dedup_buckets;
 static pthread_mutex_t g_dedup_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_dedup_unique, g_dedup_refs, g_dedup_saved_bytes, g_dedup_hits;
 static __thread char t_dedup_plain[COMP_PAGE];
+
+static uint64_t dedup_metadata_bytes(void)
+{
+    return g_dedup ? g_dedup_buckets * sizeof(*g_dedup_index) +
+                     g_npages * sizeof(*g_dedup_ptes) +
+                     g_dedup_capacity * sizeof(*g_dedup_objects) : 0;
+}
 
 static __thread char *t_cstage;
 static __thread int   t_cstage_cuda;
@@ -788,72 +793,46 @@ static int is_same_filled(const char *p, uint8_t *fill)
     return 1;
 }
 
-static int chunk_alloc(void)
+/* Only slabs with free slots are on a class list. All records and bitmaps are
+ * allocated at startup; these helpers run under g_alloc_lock without malloc. */
+static void class_link(struct slab *s)
 {
-    if (!g_nfree_chunks) return -1;
-    uint32_t i = g_chunk_hint;
-    for (uint32_t n = 0; n < g_nchunks; n++) {
-        if (!bm_test(g_chunk_busy, i)) {
-            bm_set(g_chunk_busy, i);
-            g_nfree_chunks--;
-            g_chunk_hint = (i + 1 < g_nchunks) ? i + 1 : 0;
-            return (int)i;
-        }
-        if (++i == g_nchunks) i = 0;
-    }
-    return -1;
+    s->prev = SLAB_NONE;
+    s->next = g_class_head[s->klass];
+    if (s->next != SLAB_NONE) g_slabs[s->next].prev = s->chunk;
+    g_class_head[s->klass] = s->chunk;
 }
 
-static void chunk_free(uint32_t chunk)
+static void class_unlink(struct slab *s)
 {
-    bm_clr(g_chunk_busy, chunk);
-    g_nfree_chunks++;
-    g_chunk_hint = chunk;
-}
-
-static int class_append(struct szclass *c, struct slab *s)
-{
-    if (c->n == c->cap) {
-        uint32_t cap = c->cap ? c->cap * 2 : 16;
-        struct slab **ns = realloc(c->slabs, cap * sizeof(*ns));
-        if (!ns) return -1;
-        c->slabs = ns;
-        c->cap = cap;
-    }
-    s->idx = c->n;
-    c->slabs[c->n++] = s;
-    return 0;
+    if (s->prev != SLAB_NONE) g_slabs[s->prev].next = s->next;
+    else g_class_head[s->klass] = s->next;
+    if (s->next != SLAB_NONE) g_slabs[s->next].prev = s->prev;
+    s->next = s->prev = SLAB_NONE;
 }
 
 static struct slab *slab_new(uint8_t klass)
 {
-    int chunk = chunk_alloc();
-    if (chunk < 0) return NULL;
-    struct slab *s = calloc(1, sizeof(*s));
-    if (!s) { chunk_free((uint32_t)chunk); return NULL; }
-    s->chunk = (uint32_t)chunk;
+    if (g_free_chunk == SLAB_NONE) return NULL;
+    struct slab *s = &g_slabs[g_free_chunk];
+    g_free_chunk = s->next;
+    g_nfree_chunks--;
     s->klass = klass;
     s->nobj  = (uint16_t)(SLAB_SZ / k_class_sz[klass]);
     s->nfree = s->nobj;
-    s->bm = calloc(((size_t)s->nobj + 7) / 8, 1);
-    if (!s->bm) { free(s); chunk_free((uint32_t)chunk); return NULL; }
-    if (class_append(&g_cls[klass], s) != 0) {
-        free(s->bm); free(s); chunk_free((uint32_t)chunk); return NULL;
-    }
-    g_chunk_owner[chunk] = s;
+    s->hint = 0;
+    memset(s->bm, 0, sizeof(s->bm));
+    class_link(s);
     return s;
 }
 
 static void slab_destroy(struct slab *s)
 {
-    struct szclass *c = &g_cls[s->klass];
-    uint32_t i = s->idx;
-    c->slabs[i] = c->slabs[--c->n];
-    if (i < c->n) c->slabs[i]->idx = i;
-    g_chunk_owner[s->chunk] = NULL;
-    chunk_free(s->chunk);
-    free(s->bm);
-    free(s);
+    class_unlink(s);
+    s->nobj = s->nfree = 0;
+    s->next = g_free_chunk;
+    g_free_chunk = s->chunk;
+    g_nfree_chunks++;
 }
 
 static int bm_alloc_obj(struct slab *s)
@@ -870,36 +849,38 @@ static int bm_alloc_obj(struct slab *s)
     return -1;
 }
 
-/* Caller holds g_alloc_lock. */
-static uint64_t pool_alloc(uint8_t klass)
+/* Caller holds g_alloc_lock. Return the actual class in *klass: a larger slot
+ * may be borrowed when the requested class and the unused-slab pool are empty.
+ * PTEs and dedup objects must retain this class for freeing and accounting. */
+static uint64_t pool_alloc(uint8_t *klass)
 {
-    struct szclass *c = &g_cls[klass];
-    for (uint32_t i = 0; i < c->n; i++) {
-        struct slab *s = c->slabs[i];
-        if (!s->nfree) continue;
-        int obj = bm_alloc_obj(s);
-        if (obj < 0) continue;
-        s->nfree--;
-        g_vram_obj_bytes += k_class_sz[klass];
-        return (uint64_t)s->chunk * SLAB_SZ + (uint64_t)obj * k_class_sz[klass];
+    uint32_t chunk = g_class_head[*klass];
+    struct slab *s = chunk != SLAB_NONE ? &g_slabs[chunk] : slab_new(*klass);
+    if (!s) {
+        for (int k = *klass + 1; k < NCLASS; k++) {
+            if (g_class_head[k] == SLAB_NONE) continue;
+            s = &g_slabs[g_class_head[k]];
+            break;
+        }
     }
-    struct slab *s = slab_new(klass);
     if (!s) return UINT64_MAX;
     int obj = bm_alloc_obj(s);
     if (obj < 0) return UINT64_MAX;
-    s->nfree--;
-    g_vram_obj_bytes += k_class_sz[klass];
-    return (uint64_t)s->chunk * SLAB_SZ + (uint64_t)obj * k_class_sz[klass];
+    if (--s->nfree == 0) class_unlink(s);
+    *klass = s->klass;
+    g_vram_obj_bytes += k_class_sz[*klass];
+    return (uint64_t)s->chunk * SLAB_SZ + (uint64_t)obj * k_class_sz[*klass];
 }
 
 static void pool_free(uint64_t off, uint8_t klass)
 {
     uint32_t chunk = (uint32_t)(off / SLAB_SZ);
-    struct slab *s = g_chunk_owner[chunk];
+    struct slab *s = &g_slabs[chunk];
     unsigned obj = (unsigned)((off % SLAB_SZ) / k_class_sz[klass]);
     if (g_vram_obj_bytes >= k_class_sz[klass])
         g_vram_obj_bytes -= k_class_sz[klass];
     bm_clr(s->bm, obj);
+    if (!s->nfree) class_link(s);
     s->nfree++;
     if (s->nfree == s->nobj)
         slab_destroy(s);
@@ -985,6 +966,14 @@ static void pte_kind_add(uint8_t kind, int delta)
  * published PTE or a pending batch. Pending references are rolled back together
  * on failure; old PTEs and their references remain intact until every new payload
  * has been copied and synchronized successfully. */
+static void dedup_object_release(struct dedup_obj *obj)
+{
+    obj->refs = 0;
+    obj->prev = NULL;
+    obj->next = g_dedup_free;
+    g_dedup_free = obj;
+}
+
 static void dedup_put(struct dedup_obj *obj)
 {
     if (!obj) return;
@@ -999,7 +988,7 @@ static void dedup_put(struct dedup_obj *obj)
     pthread_mutex_lock(&g_alloc_lock);
     pool_free(obj->vram_off, obj->klass);
     pthread_mutex_unlock(&g_alloc_lock);
-    free(obj);
+    dedup_object_release(obj);
 }
 
 static uint32_t dedup_get(struct cpend *op, struct dedup_obj **out,
@@ -1027,12 +1016,13 @@ static uint32_t dedup_get(struct cpend *op, struct dedup_obj **out,
         return 0;
     }
 
-    struct dedup_obj *obj = calloc(1, sizeof(*obj));
-    if (!obj) return ENOMEM;
+    struct dedup_obj *obj = g_dedup_free;
+    if (!obj) return ENOSPC;
     pthread_mutex_lock(&g_alloc_lock);
-    uint64_t off = pool_alloc(op->klass);
+    uint64_t off = pool_alloc(&op->klass);
     pthread_mutex_unlock(&g_alloc_lock);
-    if (off == UINT64_MAX) { free(obj); return ENOSPC; }
+    if (off == UINT64_MAX) return ENOSPC;
+    g_dedup_free = obj->next;
 
     CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + off,
                                     t_cstage + (size_t)op->slot * COMP_PAGE,
@@ -1042,7 +1032,7 @@ static uint32_t dedup_get(struct cpend *op, struct dedup_obj **out,
         pthread_mutex_lock(&g_alloc_lock);
         pool_free(off, op->klass);
         pthread_mutex_unlock(&g_alloc_lock);
-        free(obj);
+        dedup_object_release(obj);
         return EIO;
     }
     obj->hash = op->hash;
@@ -1112,7 +1102,7 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
     for (int i = 0; i < n; i++) {
         if (ops[i].kind != PTE_COMPRESSED && ops[i].kind != PTE_RAW)
             continue;
-        uint64_t off = pool_alloc(ops[i].klass);
+        uint64_t off = pool_alloc(&ops[i].klass);
         if (off == UINT64_MAX) { failed = i; break; }
         ops[i].new_off = off;
     }
@@ -1364,9 +1354,7 @@ static void compress_status_write(void)
     dedup_unique = g_dedup_unique;
     dedup_saved = g_dedup_saved_bytes;
     dedup_hits = g_dedup_hits;
-    index_bytes = g_dedup ? g_dedup_buckets * sizeof(*g_dedup_index) +
-                           g_npages * sizeof(*g_dedup_ptes) +
-                           g_dedup_unique * sizeof(struct dedup_obj) : 0;
+    index_bytes = dedup_metadata_bytes();
     unsigned long compressed = __atomic_load_n(&g_pages_compressed, __ATOMIC_RELAXED);
     unsigned long raw = __atomic_load_n(&g_pages_raw, __ATOMIC_RELAXED);
     unsigned long same = __atomic_load_n(&g_pages_same, __ATOMIC_RELAXED);
@@ -1434,6 +1422,23 @@ static void *status_worker(void *arg)
     return NULL;
 }
 
+/* Fault in writable backing now, including calloc's lazily mapped zero pages.
+ * Volatile stores keep this pass from being optimized back into calloc. The
+ * daemon's mlockall keeps this metadata resident while serving swap requests. */
+static void *metadata_calloc(size_t count, size_t size)
+{
+    if (size && count > SIZE_MAX / size) { errno = ENOMEM; return NULL; }
+    size_t bytes = count * size;
+    void *ptr = calloc(count, size);
+    if (!ptr) return NULL;
+    long page_size = sysconf(_SC_PAGESIZE);
+    size_t step = page_size > 0 ? (size_t)page_size : 4096;
+    volatile unsigned char *p = ptr;
+    for (size_t i = 0; i < bytes; i += step) p[i] = 0;
+    if (bytes) p[bytes - 1] = 0;
+    return ptr;
+}
+
 static int compress_init(void)
 {
     if (g_compress && (g_compress == COMP_ZSTD ? load_libzstd() : load_liblz4()) != 0) return -1;
@@ -1445,23 +1450,53 @@ static int compress_init(void)
      * the last PTE; even a sector-aligned access there would overrun the table. */
     g_export_size = (g_export_size / COMP_PAGE) * COMP_PAGE;
     g_npages = g_export_size / COMP_PAGE;
-    g_ptes = calloc(g_npages, sizeof(*g_ptes));
+    if (g_npages > SIZE_MAX / sizeof(*g_ptes) || g_vram_size / SLAB_SZ >= SLAB_NONE) {
+        fprintf(stderr, "[nbd-vram] packed store metadata exceeds addressable size\n");
+        return -1;
+    }
+    g_ptes = metadata_calloc(g_npages, sizeof(*g_ptes));
     if (!g_ptes) { perror("calloc ptes"); return -1; }
     if (g_dedup) {
         g_dedup_buckets = 16;
         while (g_dedup_buckets < g_npages / 4 && g_dedup_buckets < (1u << 20))
             g_dedup_buckets *= 2;
-        g_dedup_index = calloc(g_dedup_buckets, sizeof(*g_dedup_index));
-        g_dedup_ptes = calloc(g_npages, sizeof(*g_dedup_ptes));
-        if (!g_dedup_index || !g_dedup_ptes) { perror("calloc dedup"); return -1; }
+        /* Each logical page can hold one unique object, plus one pending batch
+         * while replacing old references. Dedup commits are serialized, so no
+         * per-worker multiplier is needed. Physical slot count is another cap. */
+        uint64_t capacity = g_vram_size / (g_compress ? k_class_sz[0] : COMP_PAGE);
+        if (capacity > g_npages + COMP_BATCH) capacity = g_npages + COMP_BATCH;
+        if (capacity > SIZE_MAX / sizeof(*g_dedup_objects)) {
+            fprintf(stderr, "[nbd-vram] dedup metadata exceeds addressable size\n");
+            return -1;
+        }
+        g_dedup_capacity = (size_t)capacity;
+        g_dedup_index = metadata_calloc(g_dedup_buckets, sizeof(*g_dedup_index));
+        g_dedup_ptes = metadata_calloc(g_npages, sizeof(*g_dedup_ptes));
+        g_dedup_objects = metadata_calloc(g_dedup_capacity, sizeof(*g_dedup_objects));
+        if (!g_dedup_index || !g_dedup_ptes || !g_dedup_objects) {
+            perror("calloc dedup"); return -1;
+        }
+        g_dedup_free = NULL;
+        for (size_t i = g_dedup_capacity; i-- > 0; )
+            dedup_object_release(&g_dedup_objects[i]);
     }
     g_nchunks = (uint32_t)(g_vram_size / SLAB_SZ);
-    g_chunk_busy  = calloc(((size_t)g_nchunks + 7) / 8, 1);
-    g_chunk_owner = calloc(g_nchunks, sizeof(*g_chunk_owner));
-    if (!g_chunk_busy || !g_chunk_owner) { perror("calloc chunks"); return -1; }
+    g_slabs = metadata_calloc(g_nchunks, sizeof(*g_slabs));
+    if (!g_slabs) { perror("calloc slabs"); return -1; }
+    for (int k = 0; k < NCLASS; k++) g_class_head[k] = SLAB_NONE;
+    g_free_chunk = SLAB_NONE;
+    for (uint32_t i = g_nchunks; i-- > 0; ) {
+        g_slabs[i].chunk = i;
+        g_slabs[i].next = g_free_chunk;
+        g_free_chunk = i;
+    }
     g_nfree_chunks = g_nchunks;
     for (int i = 0; i < NPLOCK; i++)
         pthread_mutex_init(&g_plock[i], NULL);
+    printf("[nbd-vram] reserved metadata: page table %.1f MiB, slabs %.1f MiB, dedup %.1f MiB\n",
+           (double)g_npages * sizeof(*g_ptes) / (1024.0 * 1024.0),
+           (double)g_nchunks * sizeof(*g_slabs) / (1024.0 * 1024.0),
+           (double)dedup_metadata_bytes() / (1024.0 * 1024.0));
     return 0;
 }
 
@@ -1472,31 +1507,14 @@ static void compress_shutdown(void)
     if (g_ptes)
         printf("[nbd-vram] compress: %u/%u slabs used, %lu ENOSPC writes\n",
                g_nchunks - g_nfree_chunks, g_nchunks, g_comp_enospc);
-    /* Workers are stopped; each slab is freed once below, regardless of refs. */
-    if (g_dedup_index) {
-        for (size_t i = 0; i < g_dedup_buckets; i++) {
-            struct dedup_obj *obj = g_dedup_index[i];
-            while (obj) {
-                struct dedup_obj *next = obj->next;
-                free(obj);
-                obj = next;
-            }
-        }
-    }
+    /* Workers are stopped. Pools can be released even after partial init or
+     * with live objects; individual records never own separate allocations. */
     free(g_dedup_index); g_dedup_index = NULL;
     free(g_dedup_ptes); g_dedup_ptes = NULL;
+    free(g_dedup_objects); g_dedup_objects = g_dedup_free = NULL;
+    g_dedup_capacity = 0;
     free(g_ptes); g_ptes = NULL;
-    for (int k = 0; k < NCLASS; k++) {
-        for (uint32_t i = 0; i < g_cls[k].n; i++) {
-            free(g_cls[k].slabs[i]->bm);
-            free(g_cls[k].slabs[i]);
-        }
-        free(g_cls[k].slabs);
-        g_cls[k].slabs = NULL;
-        g_cls[k].n = g_cls[k].cap = 0;
-    }
-    free(g_chunk_owner); g_chunk_owner = NULL;
-    free(g_chunk_busy);  g_chunk_busy  = NULL;
+    free(g_slabs); g_slabs = NULL;
     if (g_liblz4) { dlclose(g_liblz4); g_liblz4 = NULL; }
     for (int i = 0; i < g_nbd_threads; i++) {
         if (g_zstd_cctx[i]) _ZSTD_freeCCtx(g_zstd_cctx[i]);

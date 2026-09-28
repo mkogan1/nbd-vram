@@ -1,19 +1,5 @@
 /* Real codecs with CPU-backed CUDA copies, including injected I/O failures. */
-#include <stdlib.h>
-static int fail_calloc;
-static void *test_calloc(size_t n, size_t size);
-#define calloc test_calloc
-#define main daemon_main
-#define STATUS_PATH "nbd-vram.status"
-#include "nbd-vram.c"
-#undef main
-#undef calloc
-#include <assert.h>
-
-static void *test_calloc(size_t n, size_t size)
-{
-    return fail_calloc ? NULL : calloc(n, size);
-}
+#include "test-metadata.h"
 
 static int fail_upload, fail_download, fail_sync;
 static int upload_countdown;
@@ -101,6 +87,13 @@ static void check_references(void)
     assert(refs == g_dedup_refs && unique == g_dedup_unique && refs == pages);
     assert(saved == g_dedup_saved_bytes && object_bytes == g_vram_obj_bytes);
     assert(pages == g_pages_compressed + g_pages_raw);
+    size_t free_objects = 0;
+    for (struct dedup_obj *obj = g_dedup_free; obj; obj = obj->next) {
+        assert(obj >= g_dedup_objects && obj < g_dedup_objects + g_dedup_capacity);
+        assert(obj->refs == 0 && !obj->prev);
+        assert(++free_objects <= g_dedup_capacity); /* also catches list cycles */
+    }
+    assert(free_objects + unique == g_dedup_capacity);
 }
 
 static void clear_store(void)
@@ -136,6 +129,11 @@ static void check_sharing(void)
         assert(strstr(status, "dedup_unique_pages=1\n"));
         char line[100];
         snprintf(line, sizeof(line), "dedup_saved_bytes=%llu\n", (unsigned long long)g_dedup_saved_bytes);
+        assert(strstr(status, line));
+        uint64_t reserved = g_dedup_buckets * sizeof(*g_dedup_index) +
+                            g_npages * sizeof(*g_dedup_ptes) +
+                            g_dedup_capacity * sizeof(*g_dedup_objects);
+        snprintf(line, sizeof(line), "dedup_index_bytes=%llu\n", (unsigned long long)reserved);
         assert(strstr(status, line));
 
         /* Self-overwrite must neither free the object nor inflate live savings. */
@@ -197,9 +195,12 @@ static void check_failures(void)
     assert(comp_write(COMP_PAGE, a, COMP_PAGE, NULL) == 0);
     uint64_t hits = g_dedup_hits, saved = g_dedup_saved_bytes;
     struct dedup_obj *original = g_dedup_ptes[0];
-    fail_calloc = 1;
-    assert(comp_write(0, b, COMP_PAGE, NULL) == ENOMEM);
-    fail_calloc = 0;
+    /* Exhaust the metadata pool independently of VRAM. The original mapping
+     * survives, and restoring the free list makes later writes possible. */
+    struct dedup_obj *free_objects = g_dedup_free;
+    g_dedup_free = NULL;
+    assert(comp_write(0, b, COMP_PAGE, NULL) == ENOSPC);
+    g_dedup_free = free_objects;
     fail_download = 1;
     assert(comp_write(2 * COMP_PAGE, a, COMP_PAGE, NULL) == EIO);
     fail_download = 0;
@@ -284,10 +285,75 @@ static void check_random_operations(void)
     clear_store();
 }
 
+static void check_larger_slots(void)
+{
+    if (!g_compress) return;
+    char raw[COMP_PAGE], small[COMP_PAGE], other[COMP_PAGE], input[2 * COMP_PAGE];
+    uint64_t count = g_vram_size / COMP_PAGE;
+    for (uint64_t pg = 0; pg < count; pg++) {
+        pattern(raw, 1000 + (int)pg, 1);
+        assert(comp_write(pg * COMP_PAGE, raw, COMP_PAGE, NULL) == 0);
+    }
+    assert(comp_trim(COMP_PAGE, 2 * COMP_PAGE, NULL) == 0);
+    assert(g_nfree_chunks == 0);
+    pattern(small, 7, 0); pattern(other, 8, 0);
+    memcpy(input, small, COMP_PAGE); memcpy(input + COMP_PAGE, other, COMP_PAGE);
+    uint64_t used = g_vram_obj_bytes, unique = g_dedup_unique;
+
+    /* Both pending objects borrow raw slots. A later upload failure must
+     * return those slots and their metadata to their respective free lists. */
+    upload_countdown = 2;
+    assert(comp_write(count * COMP_PAGE, input, sizeof(input), NULL) == EIO);
+    assert(upload_countdown == 0 && g_vram_obj_bytes == used && g_dedup_unique == unique);
+    assert(!g_dedup_ptes[count] && !g_dedup_ptes[count + 1]);
+    check_references();
+    assert(comp_write(count * COMP_PAGE, small, COMP_PAGE, NULL) == 0);
+    assert(g_ptes[count].kind == PTE_COMPRESSED);
+    assert(g_ptes[count].klass == class_for(COMP_PAGE));
+    assert(g_vram_obj_bytes == used + COMP_PAGE);
+
+    /* Sharing counts the borrowed slot's actual cost, and releasing one
+     * reference keeps it alive until the final reference is removed. */
+    assert(comp_write((count + 1) * COMP_PAGE, small, COMP_PAGE, NULL) == 0);
+    assert(g_dedup_saved_bytes == COMP_PAGE);
+    assert(comp_trim(count * COMP_PAGE, COMP_PAGE, NULL) == 0);
+    read_equals(count + 1, small);
+    assert(g_vram_obj_bytes == used + COMP_PAGE && g_dedup_saved_bytes == 0);
+    assert(comp_trim((count + 1) * COMP_PAGE, COMP_PAGE, NULL) == 0);
+    assert(g_vram_obj_bytes == used);
+    check_references();
+    clear_store();
+}
+
+static void check_metadata_headroom(void)
+{
+    if (!g_compress) return;
+    char page[COMP_PAGE], input[COMP_BATCH * COMP_PAGE];
+    /* Every logical page owns a distinct small payload. Replacing a full
+     * batch must still have metadata available before old objects are freed. */
+    for (uint64_t pg = 0; pg < g_npages; pg++) {
+        pattern(page, 1, 0);
+        memcpy(page, &pg, sizeof(pg));
+        assert(comp_write(pg * COMP_PAGE, page, COMP_PAGE, NULL) == 0);
+    }
+    assert(g_dedup_unique == g_npages);
+    for (uint64_t i = 0; i < COMP_BATCH; i++) {
+        pattern(input + i * COMP_PAGE, 1, 0);
+        uint64_t id = g_npages + i;
+        memcpy(input + i * COMP_PAGE, &id, sizeof(id));
+    }
+    assert(comp_write(0, input, sizeof(input), NULL) == 0);
+    assert(g_dedup_unique == g_npages);
+    for (uint64_t i = 0; i < COMP_BATCH; i++) read_equals(i, input + i * COMP_PAGE);
+    check_references();
+    clear_store();
+}
+
 static void *concurrent_sharing(void *arg)
 {
     int idx = (int)(intptr_t)arg;
     init_worker(idx);
+    metadata_heap_forbidden = 1;
     char page[COMP_PAGE];
     for (int pass = 0; pass < 30; pass++) {
         pattern(page, pass, pass % 2);
@@ -330,10 +396,13 @@ int main(int argc, char **argv)
     assert(compress_init() == 0);
     if (g_compress == COMP_OFF) assert(!g_liblz4 && !g_libzstd);
     init_worker(0);
+    metadata_heap_forbidden = 1;
     check_sharing();
     check_collision();
     check_failures();
     check_full_pool();
+    check_larger_slots();
+    check_metadata_headroom();
     check_random_operations();
     pthread_t threads[4];
     assert(pthread_barrier_init(&barrier, NULL, 4) == 0);
@@ -348,7 +417,9 @@ int main(int argc, char **argv)
     assert(comp_write(0, page, COMP_PAGE, NULL) == 0);
     assert(comp_write(COMP_PAGE, page, COMP_PAGE, NULL) == 0);
     free(t_cstage);
+    metadata_heap_forbidden = 0;
     compress_shutdown();
+    assert(metadata_live_allocations == 0);
     free((void *)(uintptr_t)g_vram_ptr);
     assert(chdir("/") == 0 && rmdir(tmp) == 0);
     printf("PASS dedup %s: sharing, COW, TRIM, collisions, rollback, ENOSPC, random I/O, concurrency, stats\n", argv[1]);
