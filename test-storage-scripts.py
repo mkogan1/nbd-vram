@@ -84,7 +84,7 @@ dedup_pages=2
 dedup_unique_pages=1
 dedup_saved_bytes=8192
 dedup_hits=5
-dedup_index_bytes=1024
+dedup_index_bytes=92276224
 pages_lz4={3 if codec == 'lz4' else 0}
 pages_zstd={3 if codec == 'zstd' else 0}
 pages_raw={3 if codec == 'off' else 0}
@@ -94,7 +94,7 @@ pages_raw={3 if codec == 'off' else 0}
         assert "deduped pages    : 2 extra copies avoided (1 unique payloads)" in output
         assert "dedup savings    : 8192 bytes (0.01 MiB of object slots)" in output
         assert "dedup matches    : 5 matching page writes since start" in output
-        assert "dedup index RAM  : 1024 bytes" in output
+        assert "dedup index RAM  : 88.00 MiB" in output
 
     # Older daemons omit all new fields.
     status_path.write_text(base + "compress=1\npages_lz4=3\npages_raw=0\n")

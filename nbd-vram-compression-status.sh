@@ -118,7 +118,7 @@ if [ "$dedup" = "1" ]; then
     echo "  deduped pages    : ${dedup_pages} extra copies avoided (${dedup_unique} unique payloads)"
     echo "  dedup savings    : ${dedup_saved} bytes (${saved_mib} MiB of object slots)"
     echo "  dedup matches    : ${dedup_hits} matching page writes since start"
-    echo "  dedup index RAM  : ${dedup_index} bytes"
+    echo "  dedup index RAM  : ${index_mib} MiB"
     echo "  dedup net savings : ~${net_mib} MiB (${saved_mib} MiB VRAM saved − ${index_mib} MiB system RAM for index)"
 else
     echo "  deduplication    : off"
