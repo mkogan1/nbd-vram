@@ -14,8 +14,10 @@ NotifyAccess=main
 # RTX 3070 (8GB): 7168 leaves ~1GB for display/compute.
 Environment=VRAM_SETUP_SIZE_MB=7168
 Environment=VRAM_SWAP_PRIORITY=1500
-Environment=VRAM_NBD_THREADS=4
-Environment=VRAM_NBD_CONNECTIONS=4
+# Keep GPU/CPU contention low when this GPU also drives the desktop.
+Environment=VRAM_NBD_THREADS=2
+Environment=VRAM_NBD_CONNECTIONS=2
+Environment=VRAM_CUDA_SCHED=blocking
 # Compression: off, lz4, zstd, or zstd:LEVEL (1-22).
 # zstd defaults to level 3. Needs liblz4.so.1 or libzstd.so.1 for the chosen codec.
 Environment=VRAM_COMPRESS=off

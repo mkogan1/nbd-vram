@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <poll.h>
 #include <sys/un.h>
 #include <sys/stat.h>
@@ -47,6 +48,7 @@ typedef struct CUstream_st *CUstream;
 
 #define CUDA_SUCCESS           0
 #define CU_CTX_SCHED_AUTO      0
+#define CU_CTX_SCHED_BLOCKING_SYNC 4
 #define CU_STREAM_NON_BLOCKING 1
 
 typedef CUresult (*pfn_cuInit)(unsigned int);
@@ -369,16 +371,16 @@ static int nbd_handshake(int fd, uint64_t export_size, int send_trim)
 #define DEFAULT_SIZE_MB 7168
 #define SIZE_ALIGN      (64 * 1024)
 #define SOCK_PATH       "/run/nbd-vram.sock"
-#define IO_BUF_SIZE     (4 * 1024 * 1024)
+#define IO_BUF_SIZE     (64 * 1024)
 #define NBD_THREADS_MAX     64
-#define NBD_THREADS_DEFAULT  4
+#define NBD_THREADS_DEFAULT  2
 
-/* Request-level batching: drain up to N already-queued requests, issue all their
- * VRAM copies, then ONE cuStreamSynchronize for the whole batch. Amortises both
- * the per-op socket round-trip and the per-op CUDA launch+sync (the two halves of
- * the small-IO floor). Requests larger than a slot fall back to the per-op path. */
+/* Bound both request count and bytes queued before replying. Small bursts limit
+ * copy-engine occupancy on GPUs also driving a display. Larger requests use
+ * the per-op path, synchronizing each IO_BUF_SIZE chunk before submitting more. */
 #define BATCH_SLOT          (64 * 1024)   /* max per-request size that batches */
-#define BATCH_DEPTH_DEFAULT 32
+#define BATCH_BYTES_MAX     (64 * 1024)   /* total payload per worker/batch */
+#define BATCH_DEPTH_DEFAULT 8
 #define BATCH_DEPTH_MAX     256
 
 static CUdeviceptr  g_vram_ptr;
@@ -1585,19 +1587,29 @@ static void compress_shutdown(void)
     if (g_libzstd) { dlclose(g_libzstd); g_libzstd = NULL; }
 }
 
-/* Read a full 28-byte request header WITHOUT blocking if none is queued. The
- * first byte(s) decide: nothing queued -> 0 (adaptive batch cutoff); a header
- * began arriving -> finish it blocking to stay frame-aligned. */
-static int recv_hdr_nb(int fd, struct nbd_req_hdr *h)
+/* Leave incomplete frames in the socket so they cannot delay earlier replies.
+ * Only this worker reads the connection: once a complete WRITE is queued,
+ * consuming its header and payload cannot wait for the peer to send more. */
+static int peek_request_nb(int fd, struct nbd_req_hdr *h)
 {
-    ssize_t r = recv(fd, h, sizeof(*h), MSG_DONTWAIT);
+    ssize_t r;
+    do { r = recv(fd, h, sizeof(*h), MSG_PEEK | MSG_DONTWAIT); }
+    while (r < 0 && errno == EINTR);
     if (r == 0) return -1;                                   /* peer closed */
     if (r < 0)  return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
-    if ((size_t)r == sizeof(*h)) return 1;
-    return (recv_all(fd, (char *)h + r, sizeof(*h) - r) == 0) ? 1 : -1;
+    if ((size_t)r < sizeof(*h)) return 0;
+    uint32_t len = ntohl(h->len);
+    if (ntohs(h->type) == NBD_CMD_WRITE && len <= BATCH_SLOT) {
+        int queued;
+        int rc;
+        do { rc = ioctl(fd, FIONREAD, &queued); } while (rc < 0 && errno == EINTR);
+        if (rc < 0) return -1;
+        if ((size_t)queued < sizeof(*h) + len) return 0;
+    }
+    return 1;
 }
 
-/* Legacy per-request path: exact prior semantics, handles a single header that
+/* Per-request path: handles a single header that
  * was already read. Used for oversized requests, FLUSH/TRIM, and VRAM_BATCH=0.
  * Returns 0 to keep serving, -1 to drop the connection. */
 static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char *iobuf)
@@ -1629,7 +1641,11 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char
                     if (e) error = e;
                 } else {
                     CUresult r = _cuMemcpyHtoDAsync(g_vram_ptr + voff, iobuf, chunk, stream);
-                    if (r != CUDA_SUCCESS) {
+                    /* The next recv overwrites this pinned buffer. Finish DMA
+                     * before reusing it, and keep large requests in small bursts. */
+                    CUresult sync_r = _cuStreamSynchronize(stream);
+                    if (r != CUDA_SUCCESS || sync_r != CUDA_SUCCESS) {
+                        if (r == CUDA_SUCCESS) r = sync_r;
                         fprintf(stderr, "[nbd-vram] HtoD failed: %s\n", cuda_err(r));
                         error = EIO;
                     }
@@ -1638,8 +1654,6 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char
             }
             remaining -= chunk;
         }
-        if (!error && !packed_store_enabled() && _cuStreamSynchronize(stream) != CUDA_SUCCESS)
-            error = EIO;
     } else if (cmd == NBD_CMD_FLUSH) {
         if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
     } else if (cmd == NBD_CMD_TRIM && packed_store_enabled()) {
@@ -1670,7 +1684,7 @@ static int handle_one(int fd, const struct nbd_req_hdr *h, CUstream stream, char
                     fprintf(stderr, "[nbd-vram] DtoH failed: %s\n", cuda_err(r));
                     return -1;
                 }
-                _cuStreamSynchronize(stream);
+                if (_cuStreamSynchronize(stream) != CUDA_SUCCESS) return -1;
             }
             if (send_all(fd, iobuf, chunk) != 0) return -1;
             remaining -= chunk;
@@ -1847,31 +1861,26 @@ static int handle_client(int fd, CUstream stream, char *batchbuf, char *iobuf)
             continue;
         }
 
-        /* Drain whatever else is already queued, without blocking. Idle clients
-         * yield a batch of 1 (= legacy behaviour); a busy client supplies depth.
-         * The adaptivity is free: we never wait to assemble a batch. */
+        /* Only collect complete frames already queued. A byte cap bounds GPU
+         * work even when depth is raised; direction changes end the batch so
+         * reads get replies before any later writes are submitted. */
         int n = 1;
+        size_t bytes = ops[0].len;
         struct nbd_req_hdr extra;
-        int trailer = 0;   /* 0 none, 1 non-batchable header in `extra`, 2 DISC */
-        while (n < depth) {
-            int g = recv_hdr_nb(fd, &extra);
-            if (g < 0) return -1;
-            if (g == 0) break;                /* nothing more queued right now */
-            if (ntohl(extra.magic) != NBD_REQUEST_MAGIC) {
-                fprintf(stderr, "[nbd-vram] bad request magic 0x%x\n", ntohl(extra.magic));
-                return -1;
-            }
-            if (ntohs(extra.type) == NBD_CMD_DISC) { trailer = 2; break; }
-            int a = batch_admit(fd, &extra, &ops[n], batchbuf + (size_t)n * BATCH_SLOT);
-            if (a < 0) return -1;
-            if (a == 0) { trailer = 1; break; }   /* flush, then handle it per-op */
+        while (n < depth && bytes < BATCH_BYTES_MAX) {
+            int g = peek_request_nb(fd, &extra);
+            if (g <= 0) break;  /* reply to earlier work before EOF/error too */
+            uint32_t len = ntohl(extra.len);
+            if (ntohl(extra.magic) != NBD_REQUEST_MAGIC ||
+                ntohs(extra.type) != ops[0].cmd || !len || len > BATCH_SLOT ||
+                len > BATCH_BYTES_MAX - bytes) break;
+            if (recv_all(fd, &extra, sizeof(extra)) != 0) return -1;
+            if (batch_admit(fd, &extra, &ops[n], batchbuf + bytes) != 1) return -1;
+            bytes += len;
             n++;
         }
 
         if (flush_batch(fd, ops, n, stream) != 0) return -1;
-
-        if (trailer == 1) { if (handle_one(fd, &extra, stream, iobuf) != 0) return -1; }
-        else if (trailer == 2) break;
     }
     return 0;
 }
@@ -1893,11 +1902,11 @@ static void *thread_worker(void *arg)
     _cuCtxSetCurrent(g_cu_ctx);
     _cuStreamCreate(&stream, CU_STREAM_NON_BLOCKING);
     /* Pinned host memory: eliminates CUDA driver staging copy for each DMA.
-     * iobuf serves the per-op (oversized/FLUSH) path; batchbuf holds one slot
-     * per in-flight batched request. Both pinned, allocated once per worker. */
+     * iobuf serves the per-op path; batchbuf packs variable-length requests
+     * within the byte cap. Both pinned, allocated once per worker. */
     _cuMemAllocHost(&iobuf, IO_BUF_SIZE);
     if (g_batch_enabled)
-        _cuMemAllocHost(&batchbuf, (size_t)g_batch_depth * BATCH_SLOT);
+        _cuMemAllocHost(&batchbuf, BATCH_BYTES_MAX);
     t_cstage = NULL;
     t_cstage_cuda = 0;
     t_zstd_cctx = g_zstd_cctx[idx];
@@ -1964,6 +1973,16 @@ int main(void)
 {
     CUdevice  cu_dev;
     int       ret    = 1;
+    /* Startup/tuning diagnostics must reach the journal while we are running. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
+    const char *sched = getenv("VRAM_CUDA_SCHED");
+    unsigned int cuda_sched = CU_CTX_SCHED_BLOCKING_SYNC;
+    if (sched && strcmp(sched, "auto") == 0) cuda_sched = CU_CTX_SCHED_AUTO;
+    else if (sched && strcmp(sched, "blocking") != 0) {
+        fprintf(stderr, "[nbd-vram] invalid VRAM_CUDA_SCHED='%s' (expected blocking or auto)\n", sched);
+        return 1;
+    }
 
     const char *cenv = getenv("VRAM_COMPRESS");
     if (parse_compression(cenv, &g_compress, &g_compress_level) != 0) {
@@ -2021,7 +2040,9 @@ int main(void)
     }
 
     if (_cuDeviceGet(&cu_dev, 0) != CUDA_SUCCESS) goto out;
-    if (_cuCtxCreate(&g_cu_ctx, CU_CTX_SCHED_AUTO, cu_dev) != CUDA_SUCCESS) goto out;
+    if (_cuCtxCreate(&g_cu_ctx, cuda_sched, cu_dev) != CUDA_SUCCESS) goto out;
+    printf("[nbd-vram] CUDA waits: %s\n",
+           cuda_sched == CU_CTX_SCHED_BLOCKING_SYNC ? "blocking" : "auto");
 
     const char *env = getenv("VRAM_SETUP_SIZE_MB");
     size_t mb = env ? (size_t)atol(env) : DEFAULT_SIZE_MB;
@@ -2102,8 +2123,9 @@ int main(void)
     fcntl(g_listen_fd, F_SETFL, fcntl(g_listen_fd, F_GETFL, 0) | O_NONBLOCK);
 
     printf("[nbd-vram] listening on %s (%d threads)\n", sock_path, g_nbd_threads);
-    printf("[nbd-vram] request batching %s (depth %d, slot %d KiB)\n",
-           g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_SLOT / 1024);
+    printf("[nbd-vram] request batching %s (depth %d, max %d KiB total); I/O chunks %d KiB\n",
+           g_batch_enabled ? "on" : "off", g_batch_depth, BATCH_BYTES_MAX / 1024,
+           IO_BUF_SIZE / 1024);
 
     /* sd_notify READY=1 */
     {

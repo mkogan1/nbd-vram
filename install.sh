@@ -103,11 +103,10 @@ systemctl disable --now vram-swapon.service 2>/dev/null || true
 systemctl disable --now vram-swap2.service  2>/dev/null || true
 echo "      OK"
 
-# Patch thread/connection count to match available CPUs on this machine
-NCPU=$(nproc)
-sed -i "s/VRAM_NBD_THREADS=.*/VRAM_NBD_THREADS=${NCPU}/" /etc/systemd/system/vram-swap-nbd.service
-sed -i "s/VRAM_NBD_CONNECTIONS=.*/VRAM_NBD_CONNECTIONS=${NCPU}/" /etc/systemd/system/vram-swap-nbd.service
-echo "      threads/connections set to ${NCPU} (nproc)"
+# Keep the unit's conservative default: CPU count does not describe how much
+# swap traffic a display GPU can handle without affecting desktop responsiveness.
+echo "      threads/connections default to 2 for desktop responsiveness"
+echo "      use a systemd override to retain a custom connection/thread count"
 
 # Ask how much VRAM to dedicate to swap (interactive only, validated). On a
 # non-interactive run (e.g. tooling) the service-file default is left untouched.

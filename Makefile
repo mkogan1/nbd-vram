@@ -22,4 +22,5 @@ test:
 	$(CC) -O2 -g -Wall -Wextra -Werror $(CFLAGS) -o "$$tmp/test-batching" test-batching.c -ldl -lpthread; \
 	for codec in lz4 zstd:3; do for dedup in 0 1; do "$$tmp/test-batching" "$$codec" "$$dedup"; done; done; \
 	"$$tmp/test-batching" off 1; \
+	"$$tmp/test-batching" off 0; \
 	python3 test-storage-scripts.py

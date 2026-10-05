@@ -4,7 +4,9 @@
 struct CUstream_st {
     struct { void *dst; const void *src; size_t bytes; } copies[BATCH_DEPTH_MAX];
     unsigned pending, syncs, uploads, downloads;
+    size_t pending_bytes, max_pending_bytes;
     int fail_enqueue, fail_sync;
+    int require_reply_before_upload, reply_fd;
     pthread_barrier_t *read_gate;
 };
 
@@ -16,12 +18,22 @@ static CUresult queue_copy(CUstream stream, void *dst, const void *src, size_t b
     stream->copies[i].dst = dst;
     stream->copies[i].src = src;
     stream->copies[i].bytes = bytes;
+    stream->pending_bytes += bytes;
+    if (stream->pending_bytes > stream->max_pending_bytes)
+        stream->max_pending_bytes = stream->pending_bytes;
     return CUDA_SUCCESS;
 }
 
 static CUresult upload(CUdeviceptr dst, const void *src, size_t bytes, CUstream stream)
 {
     assert(dst >= g_vram_ptr && dst - g_vram_ptr + bytes <= g_vram_size);
+    if (stream->require_reply_before_upload) {
+        /* The client deliberately leaves its READ reply queued. Later writes
+         * must not be submitted until that reply has been sent. */
+        struct nbd_resp_hdr r;
+        assert(recv(stream->reply_fd, &r, sizeof(r), MSG_PEEK | MSG_DONTWAIT) == (ssize_t)sizeof(r));
+        assert(ntohl(r.magic) == NBD_RESPONSE_MAGIC && r.handle == 81);
+    }
     stream->uploads++;
     return queue_copy(stream, (void *)(uintptr_t)dst, src, bytes);
 }
@@ -41,6 +53,7 @@ static CUresult synchronize(CUstream stream)
     for (unsigned i = 0; i < stream->pending; i++)
         memcpy(stream->copies[i].dst, stream->copies[i].src, stream->copies[i].bytes);
     stream->pending = 0;
+    stream->pending_bytes = 0;
     return stream->fail_sync ? 1 : CUDA_SUCCESS;
 }
 
@@ -61,9 +74,13 @@ static void pattern(char *page, unsigned seed)
 static void clear_store(CUstream stream)
 {
     assert(!stream->pending);
-    assert(comp_trim(0, (uint32_t)g_export_size, stream) == 0);
-    assert(g_nfree_chunks == g_nchunks && !g_vram_obj_bytes);
-    assert(!g_dedup_refs && !g_dedup_unique);
+    if (packed_store_enabled()) {
+        assert(comp_trim(0, (uint32_t)g_export_size, stream) == 0);
+        assert(g_nfree_chunks == g_nchunks && !g_vram_obj_bytes);
+        assert(!g_dedup_refs && !g_dedup_unique);
+    } else {
+        memset((void *)(uintptr_t)g_vram_ptr, 0, g_vram_size);
+    }
     *stream = (struct CUstream_st){0};
 }
 
@@ -233,7 +250,7 @@ static void *serve_connection(void *arg)
 {
     struct connection *c = arg;
     init_worker(c->idx);
-    char *batch = calloc((size_t)g_batch_depth, BATCH_SLOT), *io = malloc(IO_BUF_SIZE);
+    char *batch = calloc(1, BATCH_BYTES_MAX), *io = malloc(IO_BUF_SIZE);
     assert(batch && io);
     c->result = handle_client(c->fd[1], &c->stream, batch, io);
     assert(!c->stream.pending);
@@ -246,6 +263,7 @@ static void connect_client(struct connection *c, int idx)
 {
     c->idx = idx;
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, c->fd) == 0);
+    c->stream.reply_fd = c->fd[0];
     assert(!pthread_create(&c->thread, NULL, serve_connection, c));
     unsigned char greeting[18];
     assert(recv_all(c->fd[0], greeting, sizeof(greeting)) == 0);
@@ -275,9 +293,13 @@ static void response(int fd, uint64_t handle, uint32_t error, const char *expect
     assert(recv_all(fd, &r, sizeof(r)) == 0);
     assert(ntohl(r.magic) == NBD_RESPONSE_MAGIC && r.handle == handle && ntohl(r.error) == error);
     if (expected && !error) {
-        char data[2 * BATCH_SLOT];
-        assert(len <= sizeof(data) && recv_all(fd, data, len) == 0);
-        assert(!memcmp(data, expected, len));
+        char data[COMP_PAGE];
+        for (uint32_t off = 0; off < len; ) {
+            uint32_t bytes = len - off < sizeof(data) ? len - off : sizeof(data);
+            assert(recv_all(fd, data, bytes) == 0);
+            assert(!memcmp(data, expected + off, bytes));
+            off += bytes;
+        }
     }
 }
 
@@ -287,6 +309,7 @@ static void disconnect_client(struct connection *c)
     size_t n = append_request(packet, 0, NBD_CMD_DISC, 0, 0, 0, NULL);
     assert(send_all(c->fd[0], packet, n) == 0);
     assert(!pthread_join(c->thread, NULL) && c->result == 0);
+    assert(c->stream.max_pending_bytes <= BATCH_BYTES_MAX);
     close(c->fd[0]);
 }
 
@@ -320,10 +343,12 @@ static void check_protocol(CUstream stream)
         response(c.fd[0], 1, 0, NULL, 0); response(c.fd[0], 2, 0, a, COMP_PAGE);
         response(c.fd[0], 3, 0, NULL, 0); response(c.fd[0], 4, 0, b, COMP_PAGE);
         response(c.fd[0], 5, 0, NULL, 0); response(c.fd[0], 6, 0, NULL, 0);
-        response(c.fd[0], 7, 0, zero, COMP_PAGE); response(c.fd[0], 8, 0, NULL, 0);
+        response(c.fd[0], 7, 0, packed_store_enabled() ? zero : a, COMP_PAGE);
+        response(c.fd[0], 8, 0, NULL, 0);
         response(c.fd[0], 9, EINVAL, NULL, 0); response(c.fd[0], 10, 0, b, COMP_PAGE);
         memcpy(patched, b, sizeof(patched)); memcpy(patched + 33, a, 77);
         memcpy(large, patched, sizeof(patched));
+        if (!packed_store_enabled()) memcpy(large + COMP_PAGE, a, COMP_PAGE);
         response(c.fd[0], 11, 0, NULL, 0); response(c.fd[0], 12, 0, patched, COMP_PAGE);
         response(c.fd[0], 13, 0, patched + 13, 123);
         response(c.fd[0], 14, 0, large, sizeof(large));
@@ -381,34 +406,144 @@ static void check_protocol_errors(CUstream stream)
     clear_store(stream);
 }
 
+static void check_fragmented_requests(CUstream stream)
+{
+    char a[COMP_PAGE], b[COMP_PAGE], packet[3 * COMP_PAGE];
+    pattern(a, 31); pattern(b, 42);
+    g_batch_enabled = 1;
+    g_batch_depth = BATCH_DEPTH_MAX;
+    for (int payload = 0; payload < 2; payload++) {
+        struct connection c = {0};
+        connect_client(&c, 0);
+        size_t first = append_request(packet, 0, NBD_CMD_WRITE, 0, COMP_PAGE, 1, a);
+        size_t n = append_request(packet, first, NBD_CMD_WRITE, COMP_PAGE, COMP_PAGE, 2, b);
+        size_t cut = first + (payload ? sizeof(struct nbd_req_hdr) + 17 : 7);
+        assert(send_all(c.fd[0], packet, cut) == 0);
+        /* The peer withholds the next header/payload until the first reply.
+         * A blocking batch collector would deadlock here. */
+        struct pollfd pfd = { .fd = c.fd[0], .events = POLLIN };
+        assert(poll(&pfd, 1, 5000) == 1 && (pfd.revents & POLLIN));
+        response(c.fd[0], 1, 0, NULL, 0);
+        assert(send_all(c.fd[0], packet + cut, n - cut) == 0);
+        response(c.fd[0], 2, 0, NULL, 0);
+        n = append_request(packet, 0, NBD_CMD_READ, 0, COMP_PAGE, 3, NULL);
+        n = append_request(packet, n, NBD_CMD_READ, COMP_PAGE, COMP_PAGE, 4, NULL);
+        assert(send_all(c.fd[0], packet, n) == 0);
+        response(c.fd[0], 3, 0, a, COMP_PAGE);
+        response(c.fd[0], 4, 0, b, COMP_PAGE);
+        disconnect_client(&c);
+        clear_store(stream);
+    }
+}
+
+static void check_reply_progress(CUstream stream)
+{
+    struct connection c = { .stream = { .require_reply_before_upload = 1 } };
+    connect_client(&c, 0);
+    char packet[2 * COMP_PAGE], data[COMP_PAGE], zero[COMP_PAGE] = {0};
+    pattern(data, 52);
+    size_t n = append_request(packet, 0, NBD_CMD_READ, 0, COMP_PAGE, 81, NULL);
+    n = append_request(packet, n, NBD_CMD_WRITE, COMP_PAGE, COMP_PAGE, 82, data);
+    n = append_request(packet, n, NBD_CMD_DISC, 0, 0, 0, NULL);
+    assert(send_all(c.fd[0], packet, n) == 0);
+    assert(!pthread_join(c.thread, NULL) && c.result == 0);
+    response(c.fd[0], 81, 0, zero, COMP_PAGE);
+    response(c.fd[0], 82, 0, NULL, 0);
+    close(c.fd[0]);
+    clear_store(stream);
+}
+
+static void check_transfer_limits(CUstream stream)
+{
+    /* Direct mode also covers the old >4 MiB pinned-buffer reuse corruption.
+     * Packed mode checks chunk boundaries without requiring a larger pool. */
+    uint32_t bytes = packed_store_enabled() ? 3 * BATCH_SLOT : 4 * 1024 * 1024 + COMP_PAGE;
+    char *data = malloc(bytes), *packet = malloc(bytes + 4 * sizeof(struct nbd_req_hdr));
+    assert(data && packet);
+    for (uint32_t off = 0; off < bytes; off += COMP_PAGE)
+        pattern(data + off, (off / COMP_PAGE) * 17 + off / (1024 * 1024));
+    for (int batching = 0; batching < 2; batching++) {
+        g_batch_enabled = batching;
+        g_batch_depth = BATCH_DEPTH_MAX;
+        struct connection c = {0};
+        connect_client(&c, 0);
+        size_t n = append_request(packet, 0, NBD_CMD_WRITE, 0, bytes, 1, data);
+        assert(send_all(c.fd[0], packet, n) == 0);
+        response(c.fd[0], 1, 0, NULL, 0);
+        n = append_request(packet, 0, NBD_CMD_READ, 0, bytes, 2, NULL);
+        assert(send_all(c.fd[0], packet, n) == 0);
+        response(c.fd[0], 2, 0, data, bytes);
+
+        /* Queued reads each fit the per-request limit but together exceed the
+         * total byte cap. They must be split even at maximum batch depth. */
+        n = 0;
+        for (int i = 0; i < 3; i++)
+            n = append_request(packet, n, NBD_CMD_READ, (uint64_t)i * BATCH_SLOT,
+                               BATCH_SLOT, (uint64_t)i + 3, NULL);
+        assert(send_all(c.fd[0], packet, n) == 0);
+        for (int i = 0; i < 3; i++)
+            response(c.fd[0], (uint64_t)i + 3, 0, data + i * BATCH_SLOT, BATCH_SLOT);
+        disconnect_client(&c);
+        clear_store(stream);
+    }
+    free(data); free(packet);
+}
+
+static void check_direct_errors(void)
+{
+    for (int batching = 0; batching < 2; batching++) {
+        for (int cmd = NBD_CMD_READ; cmd <= NBD_CMD_WRITE; cmd++) {
+            g_batch_enabled = batching;
+            struct connection c = { .stream = { .fail_sync = 1 } };
+            connect_client(&c, 0);
+            char data[COMP_PAGE] = {0}, packet[2 * COMP_PAGE];
+            size_t n = append_request(packet, 0, cmd, 0, COMP_PAGE, 1, data);
+            assert(send_all(c.fd[0], packet, n) == 0);
+            /* The per-request READ path sends its header before DMA. A later
+             * failure must close the connection without sending stale data. */
+            response(c.fd[0], 1, !batching && cmd == NBD_CMD_READ ? 0 : EIO, NULL, 0);
+            assert(!pthread_join(c.thread, NULL) && c.result == -1);
+            char byte;
+            assert(recv(c.fd[0], &byte, 1, 0) == 0);
+            close(c.fd[0]);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 3 && !parse_compression(argv[1], &g_compress, &g_compress_level));
     g_dedup = atoi(argv[2]);
     g_batch_debug = 1;
-    assert(packed_store_enabled());
     alarm(45); /* lock regressions must fail instead of hanging the suite */
     char tmp[] = "/tmp/nbd-vram-batching-test-XXXXXX";
     assert(mkdtemp(tmp) && chdir(tmp) == 0);
     g_nbd_threads = 4;
-    g_vram_size = 4 * 1024 * 1024;
-    g_export_size = 2 * g_vram_size;
+    g_vram_size = (packed_store_enabled() ? 4 : 8) * 1024 * 1024;
+    g_export_size = (packed_store_enabled() ? 2 : 1) * g_vram_size;
     g_vram_ptr = (CUdeviceptr)(uintptr_t)calloc(1, g_vram_size);
-    assert(g_vram_ptr && !compress_init());
+    assert(g_vram_ptr);
+    if (packed_store_enabled()) assert(!compress_init());
     _cuMemcpyHtoDAsync = upload; _cuMemcpyDtoHAsync = download; _cuStreamSynchronize = synchronize;
     init_worker(0);
     struct CUstream_st stream = {0};
-    check_batching(&stream);
-    check_failures(&stream);
-    check_concurrency(&stream);
+    if (packed_store_enabled()) {
+        check_batching(&stream);
+        check_failures(&stream);
+        check_concurrency(&stream);
+    }
     check_protocol(&stream);
-    check_protocol_errors(&stream);
+    if (packed_store_enabled()) check_protocol_errors(&stream);
+    else check_direct_errors();
+    check_fragmented_requests(&stream);
+    check_reply_progress(&stream);
+    check_transfer_limits(&stream);
     free(t_cstage);
     metadata_heap_forbidden = 0;
-    compress_shutdown();
+    if (packed_store_enabled()) compress_shutdown();
     assert(!metadata_live_allocations);
     free((void *)(uintptr_t)g_vram_ptr);
     assert(!chdir("/") && !rmdir(tmp));
-    printf("PASS batching %s dedup=%d: deferred DMA, sync counts, rollback, shared readers, contention, NBD ordering\n",
+    printf("PASS batching %s dedup=%d: deferred DMA, bounded bursts, fragmented frames, prompt replies, NBD ordering\n",
            argv[1], g_dedup);
 }

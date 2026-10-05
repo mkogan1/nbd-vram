@@ -32,7 +32,7 @@ fi
 echo "nbd-vram-connect: using $NBD_DEV"
 # Force-disconnect to clear any stale kernel state from an unclean previous shutdown
 nbd-client -d "$NBD_DEV" 2>/dev/null || true
-nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-4}
+nbd-client -unix /run/nbd-vram.sock "$NBD_DEV" -connections ${VRAM_NBD_CONNECTIONS:-2}
 mkswap "$NBD_DEV"
 # discard=pages lets the kernel TRIM freed swap slots so the packed page pool
 # can reclaim VRAM. Harmless no-op when both compression and dedup are off (TRIM is not advertised).

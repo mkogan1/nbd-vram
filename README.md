@@ -86,8 +86,9 @@ Edit `/etc/systemd/system/vram-swap-nbd.service`:
 ```ini
 Environment=VRAM_SETUP_SIZE_MB=7168    # how much VRAM to use
 Environment=VRAM_SWAP_PRIORITY=1500    # swap priority (higher = used first)
-Environment=VRAM_NBD_THREADS=8         # worker threads; install.sh sets this to nproc
-Environment=VRAM_NBD_CONNECTIONS=8     # nbd connections; keep equal to threads
+Environment=VRAM_NBD_THREADS=2         # worker threads; default favors desktop responsiveness
+Environment=VRAM_NBD_CONNECTIONS=2     # nbd connections; keep equal to threads
+Environment=VRAM_CUDA_SCHED=blocking   # blocking (default), or auto for comparison
 Environment=VRAM_COMPRESS=off          # off, lz4, zstd, or zstd:LEVEL (1-22)
 Environment=VRAM_DEDUP=0              # 1 = share identical pages (optional)
 Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compression or dedup is enabled (1.0-8.0)
@@ -95,7 +96,15 @@ Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compressi
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
 
-`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` are auto-set to `nproc` at install and should match each other. More connections let the daemon drain concurrent swap I/O in parallel; the benefit saturates around your physical core count, and single-stream workloads do not use it at all (see Performance).
+`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` default to **2** and should match each other (range 1–64). More connections allow more simultaneous swap I/O, but can compete with the compositor for CPU time, GPU memory bandwidth, and device queues. The installer now keeps the unit's default of 2 instead of setting `nproc`; this also replaces older installer-generated counts on reinstall. Use `systemctl edit vram-swap-nbd.service` to retain custom settings in an override.
+
+### Desktop responsiveness
+
+The defaults favor small bursts and fewer concurrent transfers. CUDA synchronization uses `VRAM_CUDA_SCHED=blocking` so waiting workers sleep; CUDA's `auto` policy can spin on the CPU. See [NVIDIA's synchronization documentation](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__STREAM.html). `VRAM_CUDA_SCHED=auto` restores the previous wait policy for comparison. This setting controls CPU waiting, not graphics priority or copy-engine preemption.
+
+With batching enabled, a worker collects at most `VRAM_BATCH_DEPTH` complete requests (default **8**, maximum 256) and **64 KiB total payload**, whichever comes first. It never waits for an incomplete additional header or write payload. Direction changes finish the current batch and send its replies first, so a read is answered before later writes are submitted. Large requests also transfer in 64 KiB chunks, completing each chunk before submitting the next. The daemon reserves 64 KiB for the batch buffer and 64 KiB for the per-request buffer per worker, plus codec staging when enabled.
+
+These limits bound submitted work, not wall-clock latency; GPU scheduling and system memory pressure still matter. They may reduce maximum throughput. Compare pointer/compositor smoothness and high-percentile swap latency under the same workload before increasing concurrency. For an existing installation, apply the two connection settings above as well as installing the new binary. On a GPU driving the display, leave enough VRAM free for the compositor and applications: successfully allocating swap VRAM alone does not establish that the remaining headroom is sufficient.
 
 ### Compression
 
@@ -116,7 +125,7 @@ When compression or deduplication is on, `swapon --discard=pages` is used so fre
 
 The packed store reserves and touches its page table, slab records, and slot bitmaps at startup. Slab metadata uses about 4.3 MiB of system RAM per GiB of VRAM; creating or recycling slabs during I/O does not allocate host memory. Each size class keeps a list of slabs with free slots. If its own slots and all unused slabs are exhausted, a page can use a free slot from a larger class before returning `ENOSPC`. Accounting and TRIM use the actual slot size. This fallback helps with fragmentation but cannot combine smaller holes into a larger slot.
 
-Request batching also works with compression and deduplication. `VRAM_BATCH=1` (default) collects already queued requests up to `VRAM_BATCH_DEPTH` (default 32, maximum 256). Requests up to 64 KiB can batch; aligned requests of the same direction share a device synchronization in groups of at most 32 pages. Overlapping pages, colliding lock stripes, direction changes, and partial requests split groups; FLUSH, TRIM, and oversized requests finish earlier groups first. `VRAM_BATCH=0` processes requests individually. The request buffer reserves 64 KiB per configured batch entry per worker: 2 MiB per worker at the default depth, in addition to the existing I/O and compression buffers.
+Request batching also works with compression and deduplication. `VRAM_BATCH=1` (default) uses the request and byte limits above. Aligned requests of the same direction share device synchronization; overlapping pages, colliding lock stripes, and partial requests split storage groups. FLUSH, TRIM, and oversized requests finish earlier batches first. `VRAM_BATCH=0` processes requests individually while retaining the 64 KiB transfer chunks.
 
 Readers share page locks; writes and TRIM take exclusive locks. Batches acquire lock stripes in a fixed order to avoid deadlocks across connections, and full-page compression happens before taking those locks. A successful write is visible to other connections before its reply is sent. Failed transfers are drained before reservations are recycled, and failed write groups preserve their previous mappings.
 
@@ -192,7 +201,7 @@ CPU-only allocator, compression, and deduplication regression tests (requires bo
 make test
 ```
 
-These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. Batching tests defer device copies until synchronization, inject transfer failures, exercise concurrent readers/writers/TRIM, and drive the NBD handshake and request loop over local socket pairs. They check batching limits, request ordering, and visibility across connections. The socket tests require permission to send and receive over local sockets. For the GPU/NBD smoke test:
+These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. Batching tests defer device copies until synchronization, inject transfer failures, exercise concurrent readers/writers/TRIM, and drive the NBD handshake and request loop over local socket pairs. Both direct and packed storage are covered, including byte limits, large-write buffer lifetime, replies before later writes, fragmented headers/payloads, request ordering, and visibility across connections. The socket tests require permission to send and receive over local sockets. For the GPU/NBD smoke test:
 
 ```sh
 sudo bash test-nbd.sh
