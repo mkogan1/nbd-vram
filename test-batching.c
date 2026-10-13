@@ -8,7 +8,17 @@ struct CUstream_st {
     int fail_enqueue, fail_sync;
     int require_reply_before_upload, reply_fd;
     pthread_barrier_t *read_gate;
+    pthread_barrier_t *dma_gate;
+    unsigned pause_sync;
 };
+
+/* The controller waits once for arrival, does competing I/O, then releases the
+ * worker with a second wait. No timing/sleep assumptions in the locking tests. */
+static void pause_at_gate(pthread_barrier_t *gate)
+{
+    pthread_barrier_wait(gate);
+    pthread_barrier_wait(gate);
+}
 
 static CUresult queue_copy(CUstream stream, void *dst, const void *src, size_t bytes)
 {
@@ -50,6 +60,8 @@ static CUresult synchronize(CUstream stream)
     assert(stream);
     stream->syncs++;
     if (stream->read_gate) pthread_barrier_wait(stream->read_gate);
+    if (stream->dma_gate && stream->syncs == stream->pause_sync)
+        pause_at_gate(stream->dma_gate);
     for (unsigned i = 0; i < stream->pending; i++)
         memcpy(stream->copies[i].dst, stream->copies[i].src, stream->copies[i].bytes);
     stream->pending = 0;
@@ -71,6 +83,33 @@ static void pattern(char *page, unsigned seed)
     for (unsigned i = 0; i < COMP_PAGE; i++) page[i] = (char)(i % 67 + seed);
 }
 
+static pfn_LZ4_decompress_safe real_lz4_decode;
+static size_t (*real_zstd_decode)(ZSTD_DCtx *, void *, size_t, const void *, size_t);
+static __thread pthread_barrier_t *decode_gate;
+static __thread int fail_decode;
+
+static void before_decode(void)
+{
+    if (decode_gate) {
+        pthread_barrier_t *gate = decode_gate;
+        decode_gate = NULL; /* stop once, even for a multi-page read */
+        pause_at_gate(gate);
+    }
+}
+
+static int gated_lz4_decode(const char *src, char *dst, int len, int capacity)
+{
+    before_decode();
+    return fail_decode ? -1 : real_lz4_decode(src, dst, len, capacity);
+}
+
+static size_t gated_zstd_decode(ZSTD_DCtx *ctx, void *dst, size_t capacity,
+                                const void *src, size_t len)
+{
+    before_decode();
+    return fail_decode ? SIZE_MAX : real_zstd_decode(ctx, dst, capacity, src, len);
+}
+
 static void clear_store(CUstream stream)
 {
     assert(!stream->pending);
@@ -78,6 +117,7 @@ static void clear_store(CUstream stream)
         assert(comp_trim(0, (uint32_t)g_export_size, stream) == 0);
         assert(g_nfree_chunks == g_nchunks && !g_vram_obj_bytes);
         assert(!g_dedup_refs && !g_dedup_unique);
+        assert(!g_pages_compressed && !g_pages_raw && !g_pages_same);
     } else {
         memset((void *)(uintptr_t)g_vram_ptr, 0, g_vram_size);
     }
@@ -242,6 +282,151 @@ static void check_concurrency(CUstream stream)
     for (int i = 0; i < 4; i++) assert(!pthread_join(threads[i], NULL));
     pthread_barrier_destroy(&start_gate);
     clear_store(stream);
+}
+
+struct paused_io {
+    struct CUstream_st stream;
+    pthread_barrier_t *decode_gate;
+    int writing, fail_decode;
+    uint64_t offset;
+    uint32_t len, error;
+    char data[2 * COMP_PAGE];
+};
+
+static void *run_paused_io(void *arg)
+{
+    struct paused_io *io = arg;
+    init_worker(1);
+    decode_gate = io->decode_gate;
+    fail_decode = io->fail_decode;
+    io->error = io->writing
+        ? comp_write(io->offset, io->data, io->len, &io->stream)
+        : comp_read(io->offset, io->data, io->len, &io->stream);
+    assert(!io->stream.pending);
+    free(t_cstage);
+    return NULL;
+}
+
+static void assert_page_unlocked(uint64_t pg)
+{
+    assert(pthread_rwlock_trywrlock(&g_plock[pg % NPLOCK]) == 0);
+    unlock_page(pg);
+}
+
+static void check_upload_progress(CUstream stream)
+{
+    if (g_dedup) return; /* dedup retains its existing commit lock order */
+    char old[2 * COMP_PAGE], alias[COMP_PAGE], current[2 * COMP_PAGE], out[2 * COMP_PAGE];
+    pattern(old, 71); pattern(old + COMP_PAGE, 72); pattern(alias, 73);
+    for (int failure = 0; failure < 3; failure++) {
+        assert(comp_write(0, old, sizeof(old), stream) == 0);
+        assert(comp_write((uint64_t)NPLOCK * COMP_PAGE, alias, COMP_PAGE, stream) == 0);
+        pthread_barrier_t gate;
+        assert(!pthread_barrier_init(&gate, NULL, 2));
+        struct paused_io io = {
+            .writing = 1, .len = sizeof(old),
+            .stream = { .dma_gate = &gate, .pause_sync = 1,
+                        .fail_enqueue = failure == 1 ? 2 : 0, .fail_sync = failure == 2 }
+        };
+        pattern(io.data, 74); pattern(io.data + COMP_PAGE, 75);
+        pthread_t thread;
+        assert(!pthread_create(&thread, NULL, run_paused_io, &io));
+        pthread_barrier_wait(&gate); /* upload queued, but not yet copied */
+        assert_page_unlocked(0); assert_page_unlocked(1);
+        /* Both the same pages and unrelated pages sharing their lock stripes
+         * must remain readable while the new payload is still uploading. */
+        assert(comp_read(0, out, sizeof(old), stream) == 0 && !memcmp(out, old, sizeof(old)));
+        assert(comp_read((uint64_t)NPLOCK * COMP_PAGE, out, COMP_PAGE, stream) == 0);
+        assert(!memcmp(out, alias, COMP_PAGE));
+
+        /* Change both the mapping kind and object lifetime during the upload.
+         * A stale pre-upload snapshot would free retired slots twice or corrupt
+         * accounting. Rollback must preserve these newer writes/TRIMs too. */
+        memset(current, 0x73, COMP_PAGE); memset(current + COMP_PAGE, 0, COMP_PAGE);
+        assert(comp_write(0, current, COMP_PAGE, stream) == 0);
+        assert(comp_trim(COMP_PAGE, COMP_PAGE, stream) == 0);
+        pthread_barrier_wait(&gate);
+        assert(!pthread_join(thread, NULL) && io.error == (failure ? EIO : 0));
+        assert(comp_read(0, out, sizeof(out), stream) == 0);
+        assert(!memcmp(out, failure ? current : io.data, sizeof(out)));
+        assert(comp_read((uint64_t)NPLOCK * COMP_PAGE, out, COMP_PAGE, stream) == 0);
+        assert(!memcmp(out, alias, COMP_PAGE));
+        pthread_barrier_destroy(&gate);
+        clear_store(stream);
+    }
+}
+
+static void check_partial_write_lock(CUstream stream)
+{
+    char page[COMP_PAGE], out[COMP_PAGE];
+    pattern(page, 81);
+    assert(comp_write(0, page, sizeof(page), stream) == 0);
+    pthread_barrier_t gate;
+    assert(!pthread_barrier_init(&gate, NULL, 2));
+    struct paused_io io = {
+        .writing = 1, .offset = 17, .len = 77,
+        .stream = { .dma_gate = &gate, .pause_sync = 2 } /* download, then upload */
+    };
+    pattern(io.data, 82);
+    pthread_t thread;
+    assert(!pthread_create(&thread, NULL, run_paused_io, &io));
+    pthread_barrier_wait(&gate);
+    /* The partial writer must exclude other updates until read/modify/write
+     * completes, including while the replacement payload is uploading. */
+    assert(pthread_rwlock_trywrlock(&g_plock[0]) == EBUSY);
+    pthread_barrier_wait(&gate);
+    assert(!pthread_join(thread, NULL) && !io.error);
+    memcpy(page + io.offset, io.data, io.len);
+    assert(comp_read(0, out, sizeof(out), stream) == 0 && !memcmp(out, page, sizeof(page)));
+    pthread_barrier_destroy(&gate);
+    clear_store(stream);
+}
+
+static void check_decode_progress(CUstream stream)
+{
+    if (!g_compress) return;
+    char original[2 * COMP_PAGE], replacement[2 * COMP_PAGE], out[2 * COMP_PAGE];
+    pattern(original, 91); pattern(original + COMP_PAGE, 92);
+    uint32_t rng = 719;
+    for (size_t i = 0; i < sizeof(replacement); i++) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        replacement[i] = (char)rng;
+    }
+    for (int partial = 0; partial < 2; partial++) {
+        for (int failure = 0; failure < 2; failure++) {
+            assert(comp_write(0, original, sizeof(original), stream) == 0);
+            assert(g_ptes[0].kind == PTE_COMPRESSED && g_ptes[1].kind == PTE_COMPRESSED);
+            pthread_barrier_t dma, decode;
+            assert(!pthread_barrier_init(&dma, NULL, 2));
+            assert(!pthread_barrier_init(&decode, NULL, 2));
+            struct paused_io io = {
+                .offset = partial ? 17 : 0, .len = partial ? 77 : sizeof(original),
+                .decode_gate = &decode, .fail_decode = failure,
+                .stream = { .dma_gate = &dma, .pause_sync = 1 }
+            };
+            pthread_t thread;
+            assert(!pthread_create(&thread, NULL, run_paused_io, &io));
+            pthread_barrier_wait(&dma);
+            /* Objects must remain protected until DMA finishes reading them. */
+            assert(pthread_rwlock_trywrlock(&g_plock[0]) == EBUSY);
+            if (!partial) assert(pthread_rwlock_trywrlock(&g_plock[1]) == EBUSY);
+            pthread_barrier_wait(&dma);
+            pthread_barrier_wait(&decode);
+            assert_page_unlocked(0); assert_page_unlocked(1);
+            /* Recycle VRAM and dedup references before the reader decompresses.
+             * Its private bytes and metadata must still produce the old data. */
+            assert(comp_trim(0, sizeof(original), stream) == 0);
+            assert(comp_write(0, replacement, sizeof(replacement), stream) == 0);
+            assert(g_ptes[0].kind == PTE_RAW && g_ptes[1].kind == PTE_RAW);
+            pthread_barrier_wait(&decode);
+            assert(!pthread_join(thread, NULL) && io.error == (failure ? EIO : 0));
+            if (!failure) assert(!memcmp(io.data, original + io.offset, io.len));
+            assert(comp_read(0, out, sizeof(out), stream) == 0);
+            assert(!memcmp(out, replacement, sizeof(out)));
+            pthread_barrier_destroy(&dma); pthread_barrier_destroy(&decode);
+            clear_store(stream);
+        }
+    }
 }
 
 struct connection { int fd[2], idx, result; pthread_t thread; struct CUstream_st stream; };
@@ -524,6 +709,13 @@ int main(int argc, char **argv)
     g_vram_ptr = (CUdeviceptr)(uintptr_t)calloc(1, g_vram_size);
     assert(g_vram_ptr);
     if (packed_store_enabled()) assert(!compress_init());
+    if (g_compress == COMP_LZ4) {
+        real_lz4_decode = _LZ4_decompress_safe;
+        _LZ4_decompress_safe = gated_lz4_decode;
+    } else if (g_compress == COMP_ZSTD) {
+        real_zstd_decode = _ZSTD_decompressDCtx;
+        _ZSTD_decompressDCtx = gated_zstd_decode;
+    }
     _cuMemcpyHtoDAsync = upload; _cuMemcpyDtoHAsync = download; _cuStreamSynchronize = synchronize;
     init_worker(0);
     struct CUstream_st stream = {0};
@@ -531,6 +723,9 @@ int main(int argc, char **argv)
         check_batching(&stream);
         check_failures(&stream);
         check_concurrency(&stream);
+        check_upload_progress(&stream);
+        check_partial_write_lock(&stream);
+        check_decode_progress(&stream);
     }
     check_protocol(&stream);
     if (packed_store_enabled()) check_protocol_errors(&stream);
@@ -544,6 +739,6 @@ int main(int argc, char **argv)
     assert(!metadata_live_allocations);
     free((void *)(uintptr_t)g_vram_ptr);
     assert(!chdir("/") && !rmdir(tmp));
-    printf("PASS batching %s dedup=%d: deferred DMA, bounded bursts, fragmented frames, prompt replies, NBD ordering\n",
+    printf("PASS batching %s dedup=%d: DMA lifetime, lock progress, rollback, bounded bursts, NBD ordering\n",
            argv[1], g_dedup);
 }

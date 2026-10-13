@@ -129,6 +129,8 @@ Request batching also works with compression and deduplication. `VRAM_BATCH=1` (
 
 Readers share page locks; writes and TRIM take exclusive locks. Batches acquire lock stripes in a fixed order to avoid deadlocks across connections, and full-page compression happens before taking those locks. A successful write is visible to other connections before its reply is sent. Failed transfers are drained before reservations are recycled, and failed write groups preserve their previous mappings.
 
+With dedup off, full-page writes also reserve slots and finish GPU uploads before acquiring page locks. Other connections can read the existing data during that upload, even when their pages share a lock stripe. At commit, the writer replaces the current mapping under the lock; an intervening overwrite or TRIM is accounted for at that point. Partial writes retain the lock throughout read/modify/write, and dedup writes retain their existing locking. Readers release page locks as soon as downloads finish and decompress from private staging buffers, including for partial reads.
+
 Check the live ratio with `nbd-vram-compression-status.sh` (reads `/run/nbd-vram.status`, updated about once a second). It shows the codec and level, configured vs effective ratio and whether raising `VRAM_COMPRESS_RATIO` is likely to help. Run it after the machine has actually swapped — empty or all-zero pages inflate the number.
 
 After changing, run `sudo systemctl daemon-reload && sudo systemctl restart vram-swap-nbd`.
@@ -201,7 +203,22 @@ CPU-only allocator, compression, and deduplication regression tests (requires bo
 make test
 ```
 
-These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. Batching tests defer device copies until synchronization, inject transfer failures, exercise concurrent readers/writers/TRIM, and drive the NBD handshake and request loop over local socket pairs. Both direct and packed storage are covered, including byte limits, large-write buffer lifetime, replies before later writes, fragmented headers/payloads, request ordering, and visibility across connections. The socket tests require permission to send and receive over local sockets. For the GPU/NBD smoke test:
+These use simulated VRAM and do not activate swap. They cover larger-slot fallback, allocator churn, metadata allocation failures at startup, rollback, and storage operations with metadata heap calls forbidden. Batching tests defer device copies until synchronization, inject transfer failures, exercise concurrent readers/writers/TRIM, and drive the NBD handshake and request loop over local socket pairs. Both direct and packed storage are covered, including byte limits, large-write buffer lifetime, replies before later writes, fragmented headers/payloads, request ordering, and visibility across connections. Tests pause uploads and decompression to check reader progress, mapping changes during an upload, and safe slot reuse after a download. The socket tests require permission to send and receive over local sockets.
+
+### GPU contention benchmark
+
+```sh
+make bench-contention BENCH_ARGS='lz4 10000 alias'
+make bench-contention BENCH_ARGS='lz4 10000 disjoint'
+```
+
+This standalone benchmark owns 16 MiB of VRAM on GPU 0 and runs a 4 KiB reader alongside a writer issuing 64 KiB batches, with dedup off and blocking CUDA waits. It does not attach an NBD device or change the running swap service. It requires GPU access and the selected codec library; `zstd:1` and other supported Zstd levels also work. The `alias` case uses different pages sharing lock stripes; `disjoint` provides a control using different stripes. Each run stops after the requested read count or 10 seconds (with a 30-second watchdog).
+
+It reports p50/p99/p99.9/max read latency, counts above 1/5/10 ms, and reader/writer throughput. Results use synthetic compressible pages and measure the storage functions directly: they exclude NBD queuing, kernel reclaim, and desktop frame timing. To compare revisions, compile this same benchmark with `NBD_VRAM_SOURCE` defined as a quoted path to the other revision's `nbd-vram.c`.
+
+### GPU/NBD smoke test
+
+For a test that attaches an NBD device and activates swap:
 
 ```sh
 sudo bash test-nbd.sh

@@ -765,7 +765,6 @@ static int decompress_page(const char *src, char *dst, uint16_t len)
 }
 
 static inline void lock_page(uint64_t pg)   { pthread_rwlock_wrlock(&g_plock[pg % NPLOCK]); }
-static inline void read_lock_page(uint64_t pg) { pthread_rwlock_rdlock(&g_plock[pg % NPLOCK]); }
 static inline void unlock_page(uint64_t pg) { pthread_rwlock_unlock(&g_plock[pg % NPLOCK]); }
 
 /* A batch contains distinct lock stripes. Acquire them in ascending order,
@@ -1143,17 +1142,38 @@ static uint32_t dedup_commit(struct cpend *ops, int n, CUstream stream)
     return error;
 }
 
-/* Unlocks every page in ops on all paths. Caller must not unlock again. */
-static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream)
+static void lock_pending_writes(struct cpend *ops, int n)
 {
-    if (n <= 0) return 0;
+    if (n <= 0) return;
+    uint64_t pages[COMP_BATCH];
+    for (int i = 0; i < n; i++) pages[i] = ops[i].pg;
+    lock_pages(pages, n, 1);
+}
+
+/* Snapshot only while holding the page locks. With unlocked uploads, capture
+ * after DMA: another connection may have overwritten or trimmed the page. */
+static void snapshot_old_pages(struct cpend *ops, int n)
+{
     for (int i = 0; i < n; i++) {
         struct pte *e = &g_ptes[ops[i].pg];
         ops[i].old_kind = e->kind;
         ops[i].old_off = e->vram_off;
         ops[i].old_klass = e->klass;
     }
-    if (g_dedup) return dedup_commit(ops, n, stream);
+}
+
+/* Full-page, non-dedup writes enter without page locks: reserved slots are
+ * private until DMA completes and the mappings are published. Partial writes
+ * keep their locks throughout read/modify/write; dedup keeps its existing lock
+ * order and reference lifetime. Releases any held page locks on every path. */
+static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream,
+                                     int pages_locked)
+{
+    if (n <= 0) return 0;
+    if (g_dedup) {
+        snapshot_old_pages(ops, n);
+        return dedup_commit(ops, n, stream);
+    }
 
     pthread_mutex_lock(&g_alloc_lock);
     int failed = -1;
@@ -1172,8 +1192,8 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
                 pool_free(ops[i].new_off, ops[i].klass);
         }
         pthread_mutex_unlock(&g_alloc_lock);
-        for (int i = 0; i < n; i++)
-            unlock_page(ops[i].pg);
+        if (pages_locked)
+            for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
         if (__sync_fetch_and_add(&g_comp_enospc, 1) == 0)
             fprintf(stderr, "[nbd-vram] compressed VRAM pool full (ENOSPC) - kernel will use other swap if available\n");
         return ENOSPC;
@@ -1201,10 +1221,15 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
                 pool_free(ops[i].new_off, ops[i].klass);
         }
         pthread_mutex_unlock(&g_alloc_lock);
-        for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
+        if (pages_locked)
+            for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
         return error;
     }
 
+    /* No allocator lock is held while acquiring page locks. Read the current
+     * mappings now, so an intervening write/TRIM cannot make old_off stale. */
+    if (!pages_locked) lock_pending_writes(ops, n);
+    snapshot_old_pages(ops, n);
     pthread_mutex_lock(&g_alloc_lock);
     for (int i = 0; i < n; i++) {
         if (ops[i].old_kind == PTE_COMPRESSED || ops[i].old_kind == PTE_RAW)
@@ -1233,10 +1258,8 @@ static uint32_t cpend_alloc_and_commit(struct cpend *ops, int n, CUstream stream
 
 static uint32_t write_pending(struct cpend *ops, int n, CUstream stream)
 {
-    uint64_t pages[COMP_BATCH];
-    for (int i = 0; i < n; i++) pages[i] = ops[i].pg;
-    lock_pages(pages, n, 1);
-    return cpend_alloc_and_commit(ops, n, stream);
+    if (g_dedup) lock_pending_writes(ops, n);
+    return cpend_alloc_and_commit(ops, n, stream, g_dedup);
 }
 
 static uint32_t store_partial(uint64_t pg, const char *frag, uint32_t lo, uint32_t hi, CUstream stream)
@@ -1247,7 +1270,7 @@ static uint32_t store_partial(uint64_t pg, const char *frag, uint32_t lo, uint32
     memcpy(t_page + lo, frag, hi - lo);
     struct cpend op;
     prepare_plain(pg, t_page, 0, &op);
-    return cpend_alloc_and_commit(&op, 1, stream);
+    return cpend_alloc_and_commit(&op, 1, stream, 1);
 }
 
 static uint32_t comp_write(uint64_t offset, const char *buf, uint32_t len, CUstream stream)
@@ -1313,6 +1336,9 @@ static uint32_t rpend_commit(struct rpend *ops, int n, CUstream stream)
         queued++;
     }
     if (queued && _cuStreamSynchronize(stream) != CUDA_SUCCESS) error = EIO;
+    /* DMA has finished using the VRAM objects. Decode only from this worker's
+     * private staging and metadata snapshots, allowing overwrite/TRIM to proceed. */
+    for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
     for (int i = 0; i < n && !error; i++) {
         char *dst = ops[i].dst;
         char *src = t_cstage + (size_t)ops[i].slot * COMP_PAGE;
@@ -1322,7 +1348,6 @@ static uint32_t rpend_commit(struct rpend *ops, int n, CUstream stream)
             error = EIO;
         }
     }
-    for (int i = 0; i < n; i++) unlock_page(ops[i].pg);
     return error;
 }
 
@@ -1346,11 +1371,10 @@ static uint32_t comp_read(uint64_t offset, char *buf, uint32_t len, CUstream str
                 n = 0;
                 if (err) return err;
             }
-            read_lock_page(pg);
-            uint32_t err = load_plain(pg, t_page, stream);
-            if (err) { unlock_page(pg); return err; }
+            struct rpend op = { .pg = pg, .dst = t_page, .slot = 0 };
+            uint32_t err = rpend_commit(&op, 1, stream);
+            if (err) return err;
             memcpy(buf + (pg_off + lo - offset), t_page + lo, hi - lo);
-            unlock_page(pg);
             continue;
         }
         ops[n].pg       = pg;
