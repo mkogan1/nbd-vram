@@ -1,0 +1,15 @@
+[Unit]
+Description=Evacuate VRAM swap before sleep and restore it afterwards
+Before=sleep.target nvidia-suspend.service nvidia-hibernate.service
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/libexec/vram-swap/vram-swap-ublk-sleep.sh pre
+ExecStop=/usr/local/libexec/vram-swap/vram-swap-ublk-sleep.sh post
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
+
+[Install]
+RequiredBy=sleep.target nvidia-suspend.service nvidia-hibernate.service
