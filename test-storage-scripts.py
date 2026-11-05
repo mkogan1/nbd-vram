@@ -51,8 +51,45 @@ ALLOC=3072
         else:
             assert "Logical size / VRAM ratio" not in output
 
-    # Non-interactive reinstalls retain both on and off from the installed unit.
     previous_lines = "\n".join(line for line in installer.splitlines() if line.startswith("PREV_"))
+
+    # Exercise the unit replacement and concurrency restoration used by both
+    # interactive and non-interactive installs. All system changes are stubbed.
+    install_start = installer.index("# Install binary and service")
+    install_end = installer.index("# Ask how much VRAM", install_start)
+    install_stubs = '''
+install() {
+    if [ "$3" = "$SRC_DIR/systemd/vram-swap-nbd.service" ]; then
+        cp "$3" "$TEST_UNIT"
+    fi
+}
+systemctl() { :; }
+mkdir() { :; }
+'''
+    for old_config, threads, connections in (
+        (None, 2, 2),
+        ("Environment=VRAM_NBD_THREADS=8\nEnvironment=VRAM_NBD_CONNECTIONS=8\n", 8, 8),
+        ("Environment=VRAM_NBD_THREADS=1\nEnvironment=VRAM_NBD_CONNECTIONS=1\n", 1, 1),
+        ("Environment=VRAM_NBD_THREADS=64\nEnvironment=VRAM_NBD_CONNECTIONS=64\n", 64, 64),
+        ("Environment=VRAM_NBD_THREADS=8\n", 8, 2),
+        ("Environment=VRAM_NBD_CONNECTIONS=8\n", 2, 8),
+        ("Environment=VRAM_NBD_THREADS=0\nEnvironment=VRAM_NBD_CONNECTIONS=65\n", 2, 2),
+        ("Environment=VRAM_NBD_THREADS=bad\nEnvironment=VRAM_NBD_CONNECTIONS=99999999999999999999\n", 2, 2),
+        ('  Environment="VRAM_NBD_THREADS=8"\nEnvironment=\'VRAM_NBD_CONNECTIONS=8\'\n', 8, 8),
+        ("#Environment=VRAM_NBD_THREADS=4\nEnvironment=VRAM_NBD_THREADS=2\n"
+         "Environment=VRAM_NBD_THREADS=8\nEnvironment=VRAM_NBD_CONNECTIONS=8\n", 8, 8),
+    ):
+        if old_config is None:
+            unit.unlink(missing_ok=True)
+        else:
+            unit.write_text(old_config)
+        shell(previous_lines + "\n" + install_stubs + installer[install_start:install_end],
+              env={"SRC_DIR": str(ROOT), "TEST_UNIT": str(unit)})
+        config = unit.read_text()
+        assert f"Environment=VRAM_NBD_THREADS={threads}\n" in config, old_config
+        assert f"Environment=VRAM_NBD_CONNECTIONS={connections}\n" in config, old_config
+
+    # Non-interactive reinstalls retain both on and off from the installed unit.
     preserve_start = installer.index("    # Non-interactive reinstall")
     preserve_end = installer.index("\nfi\n", preserve_start)
     for previous, codec, dedup in (("zstd:9", "zstd:9", "0"), ("zstd:9", "zstd:9", "1"), ("0", "off", "0"), ("1", "lz4", "1")):
@@ -112,4 +149,4 @@ pages_raw={3 if codec == 'off' else 0}
                                env={"VRAM_COMPRESS": codec, "VRAM_DEDUP": dedup})
                 assert output.strip() == ("direct" if codec in ("off", "0") and dedup == "0" else "discard")
 
-print("PASS installer defaults/preservation, dedup stats, legacy status, and discard activation")
+print("PASS installer defaults/concurrency/storage preservation, dedup stats, legacy status, and discard activation")

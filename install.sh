@@ -20,6 +20,8 @@ PREV_ALLOC=$(grep -oE 'VRAM_SETUP_SIZE_MB=[0-9]+' /etc/systemd/system/vram-swap-
 PREV_COMPRESS=$(sed -n 's/^Environment=VRAM_COMPRESS=\([^[:space:]]*\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 PREV_DEDUP=$(sed -n 's/^Environment=VRAM_DEDUP=\([01]\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
 PREV_RATIO=$(sed -n 's/^Environment=VRAM_COMPRESS_RATIO=\([0-9]\+\(\.[0-9]\)\?\).*/\1/p' /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | head -1 || true)
+PREV_THREADS=$(sed -nE "s/^[[:space:]]*Environment=[\"']?VRAM_NBD_THREADS=([^\"'[:space:]]*)[\"']?[[:space:]]*$/\\1/p" /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | tail -1 || true)
+PREV_CONNECTIONS=$(sed -nE "s/^[[:space:]]*Environment=[\"']?VRAM_NBD_CONNECTIONS=([^\"'[:space:]]*)[\"']?[[:space:]]*$/\\1/p" /etc/systemd/system/vram-swap-nbd.service 2>/dev/null | tail -1 || true)
 
 echo "=== nbd-vram installer ==="
 echo "Source: $SRC_DIR"
@@ -88,6 +90,23 @@ install -m 755 "$SRC_DIR/nbd-vram-compression-status.sh"    /usr/local/bin/nbd-v
 install -m 755 "$SRC_DIR/nbd-vram-connect.sh"               /usr/local/bin/nbd-vram-connect.sh
 install -m 755 "$SRC_DIR/nbd-vram-disconnect.sh"            /usr/local/bin/nbd-vram-disconnect.sh
 install -m 644 "$SRC_DIR/systemd/vram-swap-nbd.service"          /etc/systemd/system/
+# Restore explicit concurrency choices immediately after replacing the unit,
+# before either interactive or non-interactive configuration. Fresh installs
+# retain the template's conservative defaults; drop-ins are left untouched.
+for NBD_SETTING in THREADS CONNECTIONS; do
+    PREV_COUNT_KEY="PREV_${NBD_SETTING}"
+    NBD_COUNT=${!PREV_COUNT_KEY}
+    case "$NBD_COUNT" in
+        [1-9]|[1-5][0-9]|6[0-4]) ;;
+        '') continue ;;
+        *)
+            echo "      warning: ignoring invalid VRAM_NBD_${NBD_SETTING}=${NBD_COUNT}; using default 2" >&2
+            continue
+            ;;
+    esac
+    sed -i "s/^Environment=VRAM_NBD_${NBD_SETTING}=.*/Environment=VRAM_NBD_${NBD_SETTING}=${NBD_COUNT}/" /etc/systemd/system/vram-swap-nbd.service
+    echo "      preserving VRAM_NBD_${NBD_SETTING}=${NBD_COUNT}"
+done
 install -m 755 "$SRC_DIR/nbd-vram-sleep.sh"                     /usr/local/bin/nbd-vram-sleep.sh
 install -m 644 "$SRC_DIR/systemd/vram-swap-nbd-suspend.service" /etc/systemd/system/
 install -m 755 "$SRC_DIR/nbd-vram-power-check.sh"               /usr/local/bin/nbd-vram-power-check.sh
@@ -102,11 +121,6 @@ systemctl disable --now vram-setup.service  2>/dev/null || true
 systemctl disable --now vram-swapon.service 2>/dev/null || true
 systemctl disable --now vram-swap2.service  2>/dev/null || true
 echo "      OK"
-
-# Keep the unit's conservative default: CPU count does not describe how much
-# swap traffic a display GPU can handle without affecting desktop responsiveness.
-echo "      threads/connections default to 2 for desktop responsiveness"
-echo "      use a systemd override to retain a custom connection/thread count"
 
 # Ask how much VRAM to dedicate to swap (interactive only, validated). On a
 # non-interactive run (e.g. tooling) the service-file default is left untouched.

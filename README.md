@@ -96,7 +96,7 @@ Environment=VRAM_COMPRESS_RATIO=2.0    # logical swap size / VRAM when compressi
 
 The daemon tries the requested size first and backs off in 512 MiB steps if the GPU is short on memory - so it will grab as much as it can even if the display compositor is already loaded. `VRAM_SETUP_SIZE_MB` is the ceiling, not a hard requirement.
 
-`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` default to **2** and should match each other (range 1–64). More connections allow more simultaneous swap I/O, but can compete with the compositor for CPU time, GPU memory bandwidth, and device queues. The installer now keeps the unit's default of 2 instead of setting `nproc`; this also replaces older installer-generated counts on reinstall. Use `systemctl edit vram-swap-nbd.service` to retain custom settings in an override.
+`VRAM_NBD_THREADS` / `VRAM_NBD_CONNECTIONS` default to **2** and should match each other (range 1–64). More connections allow more simultaneous swap I/O, but can compete with the compositor for CPU time, GPU memory bandwidth, and device queues. Fresh installs use 2; interactive and non-interactive reinstalls preserve valid counts from the existing service file. Missing or invalid counts use the template default. Settings in systemd overrides are also retained; use `systemctl edit vram-swap-nbd.service` to keep custom settings separate from the installed unit.
 
 ### Desktop responsiveness
 

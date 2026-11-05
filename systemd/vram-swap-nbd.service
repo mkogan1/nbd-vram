@@ -17,6 +17,7 @@ Environment=VRAM_SWAP_PRIORITY=1500
 # Keep GPU/CPU contention low when this GPU also drives the desktop.
 Environment=VRAM_NBD_THREADS=2
 Environment=VRAM_NBD_CONNECTIONS=2
+# CPU wait policy: blocking (default) sleeps until GPU work finishes; auto lets CUDA choose and may busy-wait, using more CPU.
 Environment=VRAM_CUDA_SCHED=blocking
 # Compression: off, lz4, zstd, or zstd:LEVEL (1-22).
 # zstd defaults to level 3. Needs liblz4.so.1 or libzstd.so.1 for the chosen codec.
