@@ -1,5 +1,9 @@
 # nbd-vram
 
+An opt-in [experimental ublk/LZO target](experimental/ublk-lzo/README.md)
+adds demand-allocated CUDA VMM storage and preallocated Btrfs fallback.
+It has separate build/tests and does not change the default NBD installer.
+
 ## Use your NVIDIA GPU's VRAM as swap space on Linux.
 
 Built for hybrid graphics laptops with soldered memory and no upgrade path. The display runs off the integrated AMD/ATI GPU. The NVIDIA card sits idle most of the time, its VRAM completely unused. This puts that VRAM to work as high-priority swap.
