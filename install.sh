@@ -308,24 +308,29 @@ systemctl enable --now nbd-vram-battery-watch.timer
 udevadm control --reload-rules
 echo "      OK"
 
-# Bring the freshly installed binary live. restart() starts a stopped unit too,
-# so this covers both fresh installs and upgrades. Non-fatal: power management may
-# legitimately keep it stopped (e.g. on battery), and that should not fail install.
+# Bring the freshly installed binary live - but ONLY if the unit is enabled.
+# 'systemctl enable/disable' is the sole switch: a disabled unit is never started
+# by the installer (nor by the power-check or sleep hooks).
 echo "[5/5] Starting vram-swap-nbd.service..."
-if [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
-    echo "      (upgrade - restarting to load the new binary)"
-fi
-if systemctl restart vram-swap-nbd.service; then
-    sleep 2
-    if systemctl is-active --quiet vram-swap-nbd.service; then
-        echo "      OK - swap active:"
-        swapon --show | sed 's/^/      /'
-    else
-        echo "      service did not stay active - check: journalctl -u vram-swap-nbd -n 20"
-    fi
+if ! systemctl is-enabled --quiet vram-swap-nbd.service 2>/dev/null; then
+    echo "      skipped - vram-swap-nbd.service is disabled"
+    echo "      enable + start with: sudo systemctl enable --now vram-swap-nbd.service"
 else
-    echo "      start deferred (power management may have it disabled on battery)"
-    echo "      start manually with: sudo systemctl start vram-swap-nbd.service"
+    if [ "$SERVICE_WAS_ACTIVE" = "1" ]; then
+        echo "      (upgrade - restarting to load the new binary)"
+    fi
+    if systemctl restart vram-swap-nbd.service; then
+        sleep 2
+        if systemctl is-active --quiet vram-swap-nbd.service; then
+            echo "      OK - swap active:"
+            swapon --show | sed 's/^/      /'
+        else
+            echo "      service did not stay active - check: journalctl -u vram-swap-nbd -n 20"
+        fi
+    else
+        echo "      start deferred (power management may have it disabled on battery)"
+        echo "      start manually with: sudo systemctl start vram-swap-nbd.service"
+    fi
 fi
 
 echo ""
