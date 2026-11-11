@@ -30,9 +30,13 @@ Environment=VRAM_COMPRESS_RATIO=2.0
 
 # Wake GPU before CUDA init to avoid GSP RPC timeout (Xid 119 on laptops)
 ExecStartPre=/usr/bin/nvidia-smi -pm 1
-# Swap aggressively before RAM fills so the kernel never runs out of memory
-# to process swap requests. Reset on stop by nbd-vram-disconnect.sh.
-ExecStartPre=/sbin/sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
+# Keep 512 MiB of free-memory headroom for userspace swap I/O.
+# Reset on stop by nbd-vram-disconnect.sh.
+# TBD testing (provisional): trial 100 instead of 200 to reduce preference for
+# swapping application pages over reclaiming file cache. Validate responsiveness
+# and memory pressure under load before settling on this value.
+# ExecStartPre=/sbin/sysctl -w vm.swappiness=200 vm.min_free_kbytes=524288
+ExecStartPre=/sbin/sysctl -w vm.swappiness=100 vm.min_free_kbytes=524288
 
 ExecStart=/usr/local/bin/nbd-vram
 ExecStartPost=/usr/local/bin/nbd-vram-connect.sh
