@@ -1,0 +1,445 @@
+#!/bin/busybox sh
+export PATH=/bin:/usr/bin LD_LIBRARY_PATH=/usr/lib
+/bin/busybox --install -s /bin
+mount -t proc proc /proc || exit 1
+mount -t sysfs sys /sys || exit 1
+mount -t devtmpfs devtmpfs /dev || exit 1
+mkdir -p /run /run/ublk /run/ublksrvd /tmp
+fail() { echo "INTEGRATION_FAIL $*"; dmesg | tail -n 60; poweroff -f; exit 1; }
+wait_target_log() {
+    wait_i=0
+    until grep -Eq "$1" /tmp/target.log; do
+        grep -q '^UBLK_DRAIN_FAILED ' /tmp/target.log && fail drain_failed
+        kill -0 "$target" 2>/dev/null || fail drain_target_exited
+        test "$wait_i" -lt "${2:-200}" || fail drain_result_timeout
+        sleep 0.1; wait_i=$((wait_i + 1))
+    done
+}
+confirm_repeated_drain() {
+    wait_target_log '^UBLK_DRAIN_OK seq=[0-9]+ errno=0$'
+    drain_seq=$(sed -n 's/^UBLK_DRAIN_OK seq=\([0-9][0-9]*\) errno=0$/\1/p' /tmp/target.log)
+    case "$drain_seq" in ''|*[!0-9]*) fail drain_sequence ;; esac
+    kill -USR2 "$target" || fail drain_repeat_signal
+    wait_target_log "^UBLK_DRAIN_STATUS state=3 seq=$drain_seq errno=0$" 50
+    echo "INTEGRATION_DRAIN_CONFIRMED seq=$drain_seq"
+}
+confirm_safe_busy() {
+    busy_before=$(grep -c '^UBLK_STOP_RETAINED result=-16 resources_retained=1$' /tmp/target.log)
+    kill -TERM "$target" || fail safe_busy_signal
+    busy_i=0
+    while test "$(grep -c '^UBLK_STOP_RETAINED result=-16 resources_retained=1$' /tmp/target.log)" -le "$busy_before"; do
+        kill -0 "$target" 2>/dev/null || fail safe_busy_target_exited
+        test "$busy_i" -lt 50 || fail safe_busy_timeout
+        sleep 0.1; busy_i=$((busy_i + 1))
+    done
+    echo INTEGRATION_SAFE_STOP_BUSY_CONFIRMED
+}
+/usr/bin/guest-check "$(cat /mode)" || fail fixture
+case "$(cat /proc/cmdline)" in *integration_negative=1*)
+    echo NEGATIVE_TRACE_BEGIN
+    timeout 20 strace -f -qq -e trace=execve,open,openat,openat2,creat -o /tmp/open.trace /bin/sh /target-command > /tmp/target.log 2>&1
+    rc=$?
+    cat /tmp/target.log
+    grep -F -f /guard-message /tmp/target.log || fail guard_diagnostic_missing
+    cat /tmp/open.trace || fail trace_missing
+    echo NEGATIVE_TRACE_END
+    test "$rc" -ne 0 && test "$rc" -ne 124 && test "$rc" -ne 125 && test "$rc" -ne 126 && test "$rc" -ne 127 || fail "negative_exit=$rc"
+    test -s /tmp/open.trace || fail empty_trace
+    grep -E 'execve\("/usr/bin/target",.*= 0$' /tmp/open.trace >/dev/null || fail target_exec_missing
+    grep -Fx 'ublk guest guard rejected environment' /tmp/target.log >/dev/null || fail actual_guard_missing
+    grep -F 'ublk-control' /tmp/open.trace && fail control_open_attempt
+    echo "NEGATIVE_PASS rc=$rc"
+    poweroff -f; exit 0 ;;
+esac
+case "$(cat /proc/cmdline)" in *vram_isolated_guest=1*) ;; *) fail marker ;; esac
+if test "$(cat /cuda-bridge)" = 1; then
+    i=0
+    while test ! -c /dev/vport0p1 && test "$i" -lt 5; do sleep 1; i=$((i + 1)); done
+    test -c /dev/vport0p1 || fail cuda_bridge_port
+    test "$(cat /sys/class/virtio-ports/vport0p1/name)" = vram.cuda || fail cuda_bridge_name
+    export CUDA_BRIDGE_DEVICE=/dev/vport0p1
+fi
+mkdir -p /mnt/back
+fs=$(cat /backing-fs)
+case "$fs" in
+    ext4) /usr/bin/mkfs.ext4 -F -q /dev/vda || fail backing_format ;;
+    btrfs) /usr/bin/mkfs.btrfs -f -q -s "$(cat /btrfs-sectorsize)" /dev/vda || fail backing_format ;;
+    *) fail backing_filesystem ;;
+esac
+mount -t "$fs" /dev/vda /mnt/back || fail backing_mount
+if test "$(cat /backing-probe)" = 1; then
+    /bin/sh /target-command || fail backing_probe
+    echo INTEGRATION_BACKING_PROBE_PASS
+    poweroff -f; exit 0
+fi
+insmod /modules/ublk.ko || fail module
+if test "$(cat /native-cuda)" = 1; then
+    insmod /modules/nvkvm.ko || fail native_cuda_module
+    test -c /dev/nvidiactl && test -c /dev/nvidia0 && test -c /dev/nvidia-uvm || fail native_cuda_nodes
+    echo INTEGRATION_NATIVE_CUDA_MODULE_READY
+fi
+if test "$(cat /systemd-lifecycle)" = 1; then
+    rmdir /run/ublksrvd || fail systemd_runtime_directory
+    exec /usr/lib/systemd/systemd --system --unit=vram-test.target --log-target=console --log-level=debug
+    fail systemd_exec
+fi
+if test "$(cat /ready-notification-failure)" = 1; then
+    timeout 8 env NOTIFY_SOCKET=/tmp/absent-notify.sock /bin/sh /target-command > /tmp/notify-failure.log 2>&1
+    rc=$?
+    cat /tmp/notify-failure.log
+    test "$rc" -eq 1 || fail "notify_failure_status=$rc"
+    test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail notify_failure_device_remains
+    echo INTEGRATION_NOTIFY_FAILURE_PASS
+    poweroff -f; exit 0
+fi
+if test "$(cat /start-params-failure)" = 1; then
+    timeout 8 env LD_PRELOAD=/usr/lib/start-fault.so /bin/sh /target-command > /tmp/start-fault.log 2>&1
+    rc=$?
+    cat /tmp/start-fault.log
+    test "$rc" -eq 1 || fail "start_params_status=$rc"
+    test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail start_params_device_remains
+    echo INTEGRATION_START_PARAMS_REFUSAL_PASS
+    poweroff -f; exit 0
+fi
+if test "$(cat /cuda-fixture-init-failure)" = 1; then
+    CUDA_FIXTURE_FAIL_INIT=1 /bin/sh /target-command > /tmp/cuda-init.log 2>&1
+    rc=$?
+    cat /tmp/cuda-init.log
+    test "$rc" -eq 1 || fail cuda_init_status
+    grep -Fx 'CUDA_FIXTURE_NOT_REAL' /tmp/cuda-init.log >/dev/null || fail cuda_fixture_missing
+    grep -Fx 'ublk CUDA initialization failed (no mock fallback)' /tmp/cuda-init.log >/dev/null || fail cuda_init_diagnostic
+    test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail cuda_init_device_created
+    echo INTEGRATION_CUDA_INIT_REFUSAL_PASS
+    poweroff -f; exit 0
+fi
+if test "$(cat /cuda-fixture-low-free)" = 1; then
+    if test "$(cat /cuda-bridge)" = 1; then
+        export CUDA_BRIDGE_TEST_LOW_FREE=after-marker
+    elif test "$(cat /native-cuda)" = 1; then
+        export VRAM_TEST_CUDA_LOW_FREE=after-marker
+    else
+        export CUDA_FIXTURE_LOW_FREE=after-marker
+    fi
+fi
+if test "$(cat /stop-with-held-io)" = 1; then
+    export CUDA_FIXTURE_COPY_BARRIER=1
+fi
+if test "$(cat /trace-io)" = 1; then
+    export VRAM_TEST_TRACE_IO=1
+else
+    unset VRAM_TEST_TRACE_IO
+fi
+mkfifo /tmp/target.console || fail target_fifo
+if test "$(cat /require-ready-notification)" = 1; then
+    /usr/bin/notify-guest "$(cat /capacity)" &
+    notifier=$!
+    i=0
+    while test ! -S /tmp/ublk-notify.sock; do
+        kill -0 "$notifier" 2>/dev/null || fail notify_listener_exited
+        test "$i" -lt 100 || fail notify_listener_timeout
+        sleep 0.1; i=$((i + 1))
+    done
+    export NOTIFY_SOCKET=/tmp/ublk-notify.sock
+fi
+awk -v logfile=/tmp/target.log '{ print; fflush(); print > logfile; fflush(logfile) }' < /tmp/target.console &
+logger=$!
+if test "$(cat /stop-lost-reply)" = 1; then
+    VRAM_TEST_STOP_LOST_REPLY=1 LD_PRELOAD=/usr/lib/stop-fault.so /bin/sh /target-command > /tmp/target.console 2>&1 &
+elif test "$(cat /stop-failure-once)" = 1; then
+    LD_PRELOAD=/usr/lib/stop-fault.so /bin/sh /target-command > /tmp/target.console 2>&1 &
+else
+    /bin/sh /target-command > /tmp/target.console 2>&1 &
+fi
+target=$!
+i=0
+while test ! -b /dev/ublkb0 && test "$i" -lt 30; do
+    kill -0 "$target" 2>/dev/null || fail target_exited
+    sleep 1; i=$((i + 1))
+done
+test -b /dev/ublkb0 || fail device_missing
+echo INTEGRATION_DEVICE_READY
+if test "$(cat /require-ready-notification)" = 1; then
+    wait "$notifier" || fail readiness_notification
+    unset NOTIFY_SOCKET
+fi
+if test "$(cat /fill-backing-filesystem)" = 1; then
+    dd if=/dev/zero of=/mnt/back/filler bs=1048576 count=512 2>/tmp/fill.log
+    rc=$?
+    cat /tmp/fill.log
+    test "$rc" -ne 0 || fail fill_did_not_exhaust
+    grep -F 'No space left on device' /tmp/fill.log >/dev/null || fail fill_not_enospc
+    sync
+    echo INTEGRATION_BACKING_ENOSPC_REACHED
+    reclaim_filler=$(cat /reclaim-filler-mib)
+    if test "$reclaim_filler" -gt 0; then
+        filler_size=$(stat -c %s /mnt/back/filler) || fail filler_stat
+        remaining=$((filler_size - reclaim_filler * 1048576))
+        test "$remaining" -ge 0 || fail filler_too_small
+        truncate -s "$remaining" /mnt/back/filler || fail filler_truncate
+        sync
+        echo "INTEGRATION_FILLER_RECLAIMED_MIB=$reclaim_filler"
+    fi
+    /usr/bin/guest-watch "$target" &
+fi
+if test "$(cat /managed-swap-lifecycle)" = 1; then
+    grep -F '/dev/ublkb0' /proc/swaps || fail managed_swap_missing
+    mkdir -p /sys/fs/cgroup
+    mount -t cgroup2 none /sys/fs/cgroup || fail managed_cgroup_mount
+    echo +memory > /sys/fs/cgroup/cgroup.subtree_control || fail managed_controller
+    mkdir /sys/fs/cgroup/pageout || fail managed_cgroup
+    export VRAM_PAGEOUT_BARRIER=1
+    /bin/sh -c 'echo $$ > /sys/fs/cgroup/pageout/cgroup.procs; exec /usr/bin/swap-pressure "$1"' sh "$(cat /swap-pressure-mib)" &
+    helper=$!
+    i=0
+    while test ! -f /tmp/pageout-ready; do
+        kill -0 "$helper" 2>/dev/null || fail managed_helper_exited
+        test "$i" -lt 150 || fail managed_barrier_timeout
+        sleep 0.1; i=$((i + 1))
+    done
+    echo INTEGRATION_MANAGED_SWAPPED
+    kill -TERM "$target" || fail managed_term
+    if test "$(cat /managed-swapoff-failure-once)" = 1; then
+        wait_target_log '^UBLK_STOP_RETAINED result=-16 resources_retained=1$'
+        kill -0 "$target" 2>/dev/null || fail managed_failed_swapoff_exited
+        test -b /dev/ublkb0 && test -c /dev/ublkc0 || fail managed_failed_swapoff_nodes
+        grep -F '/dev/ublkb0' /proc/swaps || fail managed_failed_swapoff_detached
+        touch /tmp/pageout-resume || fail managed_retained_resume
+        wait "$helper" || fail managed_retained_data
+        echo INTEGRATION_MANAGED_RETAINED_DATA_PASS
+        kill -TERM "$target" || fail managed_retry_term
+    fi
+    i=0
+    while kill -0 "$target" 2>/dev/null; do
+        test "$i" -lt 300 || fail managed_stop_timeout
+        sleep 0.1; i=$((i + 1))
+    done
+    wait "$target" || fail managed_target_status
+    wait "$logger" || fail managed_logger
+    grep -F '/dev/ublkb0' /proc/swaps && fail managed_swap_remains
+    test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail managed_nodes_remain
+    if test "$(cat /managed-swapoff-failure-once)" != 1; then
+        touch /tmp/pageout-resume || fail managed_resume
+        wait "$helper" || fail managed_data
+    fi
+    echo INTEGRATION_MANAGED_SWAP_PASS
+    poweroff -f; exit 0
+fi
+echo "INTEGRATION_RAW_IO_BEGIN uptime=$(cat /proc/uptime)"
+/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" || fail io
+echo "INTEGRATION_RAW_IO_END uptime=$(cat /proc/uptime)"
+if test "$(cat /stop-with-held-io)" = 1; then
+    touch /tmp/cuda-copy-arm || fail held_arm
+    /usr/bin/held-read /dev/ublkb0 "$(cat /capacity)" &
+    reader=$!
+    i=0
+    while test ! -f /tmp/cuda-copy-ready && test "$i" -lt 5; do
+        kill -0 "$reader" 2>/dev/null || fail held_reader_exited
+        sleep 1; i=$((i + 1))
+    done
+    test -f /tmp/cuda-copy-ready || fail held_not_ready
+    kill -TERM "$target" || fail held_term
+    sleep 1
+    kill -0 "$target" 2>/dev/null || fail held_target_exited
+    echo INTEGRATION_HELD_RELEASE_BEGIN
+    touch /tmp/cuda-copy-release || fail held_release
+    wait "$reader" || fail held_read
+    i=0
+    while kill -0 "$target" 2>/dev/null && test "$i" -lt 8; do
+        sleep 1; i=$((i + 1))
+    done
+    kill -0 "$target" 2>/dev/null && fail held_stop_timeout
+    wait "$target" || fail held_stop_status
+    wait "$logger" || fail held_log_relay
+    test ! -b /dev/ublkb0 || fail held_device_remains
+    echo INTEGRATION_HELD_IO_STOP_PASS
+    poweroff -f; exit 0
+fi
+if test "$(cat /cuda-fixture-low-free)" = 1 && test "$(cat /low-free-after-stop)" != 1; then
+    touch /tmp/cuda-low-free || fail low_free_marker
+    echo INTEGRATION_LOW_FREE_TRIGGERED
+    wait_target_log '^UBLK_DRAIN_OK seq=[0-9]+ errno=0$'
+    echo INTEGRATION_RETAINED_DATA_BEGIN
+    /usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --verify-final-random || fail retained_data
+    echo INTEGRATION_RETAINED_DATA_PASS
+fi
+mkswap /dev/ublkb0 || fail mkswap
+swapon /dev/ublkb0 || fail swapon
+grep -F '/dev/ublkb0' /proc/swaps || fail swap_missing
+kill -TERM "$target" || fail active_term
+sleep 1
+kill -0 "$target" 2>/dev/null || fail active_term_exited
+if test "$(cat /low-free-after-stop)" = 1; then
+    wait_target_log '^UBLK_STOP_RETAINED result=-16 resources_retained=1$'
+    retained_before=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail stop_auto_digest_before
+    echo INTEGRATION_RETAINED_STOP_PRESSURE_BEGIN
+    touch /tmp/cuda-low-free || fail stop_auto_pressure_marker
+    wait_target_log '^UBLK_DRAIN_OK seq=[0-9]+ errno=0$'
+    echo INTEGRATION_RETAINED_DATA_BEGIN
+    retained_after=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail stop_auto_digest_after
+    test "$retained_before" = "$retained_after" || fail stop_auto_digest_mismatch
+    echo INTEGRATION_RETAINED_DATA_PASS
+fi
+kill -INT "$target" || fail active_int
+sleep 1
+kill -0 "$target" 2>/dev/null || fail active_int_exited
+echo INTEGRATION_ACTIVE_SWAP_SIGNAL_PASS
+swapoff /dev/ublkb0 || fail alias_prepare
+IFS=: read -r major minor < /sys/class/block/ublkb0/dev || fail alias_dev_numbers
+mknod /dev/swap-alias b "$major" "$minor" || fail alias_node
+swapon /dev/swap-alias || fail alias_swapon
+grep -F '/dev/swap-alias' /proc/swaps || fail alias_not_active
+kill -TERM "$target" || fail alias_term
+sleep 1
+kill -0 "$target" 2>/dev/null || fail alias_term_exited
+swapoff /dev/swap-alias || fail alias_swapoff
+swapon /dev/ublkb0 || fail primary_reactivate
+echo INTEGRATION_SWAP_ALIAS_PASS
+if test "$(cat /safe-stop-probe)" = 1 || test "$(cat /safe-stop-target)" = 1; then
+    if test "$(cat /safe-stop-target)" = 1; then confirm_safe_busy
+    else /usr/bin/try-stop-probe --busy || fail try_stop_active_direct; fi
+    swapoff /dev/ublkb0 || fail try_stop_direct_swapoff
+    insmod /modules/loop.ko || fail loop_module
+    test -b /dev/loop0 || mknod /dev/loop0 b 7 0 || fail loop_node
+    losetup /dev/loop0 /dev/ublkb0 || fail loop_attach
+    swapon /dev/loop0 || fail loop_swapon
+    if test "$(cat /safe-stop-target)" = 1; then confirm_safe_busy
+    else /usr/bin/try-stop-probe --busy || fail try_stop_active_loop; fi
+    kill -0 "$target" 2>/dev/null || fail try_stop_busy_target_exited
+    swapoff /dev/loop0 || fail loop_swapoff
+    losetup -d /dev/loop0 || fail loop_detach
+    dd if=/dev/zero of=/mnt/back/unrelated-swap bs=1048576 count=8 || fail unrelated_allocate
+    mkswap /mnt/back/unrelated-swap || fail unrelated_mkswap
+    swapon /mnt/back/unrelated-swap || fail unrelated_swapon
+    if test "$(cat /safe-stop-target)" = 1; then
+        kill -TERM "$target" || fail safe_final_signal
+        i=0
+        while kill -0 "$target" 2>/dev/null && test "$i" -lt 8; do sleep 1; i=$((i + 1)); done
+        kill -0 "$target" 2>/dev/null && fail safe_final_timeout
+        wait "$target" || fail safe_final_status
+        wait "$logger" || fail safe_final_logger
+        test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail safe_final_nodes
+        grep -F '/mnt/back/unrelated-swap' /proc/swaps || fail safe_final_unrelated_lost
+        echo INTEGRATION_SAFE_STOP_UNRELATED_SWAP_RETAINED
+        swapoff /mnt/back/unrelated-swap || fail safe_final_unrelated_swapoff
+        echo INTEGRATION_SAFE_STOP_TARGET_PASS
+        poweroff -f; exit 0
+    fi
+    /usr/bin/try-stop-probe --stop || fail try_stop_empty
+    grep -F '/mnt/back/unrelated-swap' /proc/swaps || fail unrelated_swap_lost
+    echo INTEGRATION_SAFE_STOP_UNRELATED_SWAP_RETAINED
+    swapoff /mnt/back/unrelated-swap || fail unrelated_swapoff
+    kill -TERM "$target" 2>/dev/null || true
+    i=0
+    while kill -0 "$target" 2>/dev/null && test "$i" -lt 8; do sleep 1; i=$((i + 1)); done
+    kill -0 "$target" 2>/dev/null && fail safe_stop_target_timeout
+    wait "$target"; rc=$?
+    test "$rc" -eq 0 || test "$rc" -eq 1 || fail safe_stop_target_status
+    wait "$logger" || fail safe_stop_logger
+    test ! -b /dev/ublkb0 && test ! -c /dev/ublkc0 || fail safe_stop_nodes_remain
+    echo INTEGRATION_SAFE_STOP_PROBE_PASS
+    poweroff -f; exit 0
+fi
+pressure=$(cat /swap-pressure-mib)
+if test "$(cat /drain-before-pageout)" = 1; then
+    kill -USR2 "$target" || fail drain_signal
+    confirm_repeated_drain
+fi
+if test "$pressure" -gt 0; then
+    mkdir -p /sys/fs/cgroup
+    mount -t cgroup2 none /sys/fs/cgroup || fail cgroup_mount
+    echo +memory > /sys/fs/cgroup/cgroup.subtree_control || fail memory_controller
+    mkdir /sys/fs/cgroup/pageout || fail pageout_cgroup
+    if test -f /sys/module/zswap/parameters/enabled; then
+        test "$(cat /sys/module/zswap/parameters/enabled)" = N || fail zswap_enabled
+    fi
+    cat /proc/vmstat | grep -E '^pswp(in|out) '
+    echo INTEGRATION_PAGEOUT_BEGIN
+    reclaim=$(cat /reclaim-pressure-mib)
+    cycle=0
+    while test "$cycle" -lt "$(cat /swap-cycles)"; do
+    rm -f /tmp/pageout-resume
+    export VRAM_PAGEOUT_BARRIER=1
+    if test "$reclaim" -gt 0; then
+        /bin/sh -c 'echo $$ > /sys/fs/cgroup/pageout/cgroup.procs; exec /usr/bin/swap-pressure "$1" "$2"' sh "$pressure" "$reclaim" &
+    else
+        /bin/sh -c 'echo $$ > /sys/fs/cgroup/pageout/cgroup.procs; exec /usr/bin/swap-pressure "$1"' sh "$pressure" &
+    fi
+    helper=$!
+    i=0
+    while test ! -f /tmp/pageout-ready && test "$i" -lt 15; do
+        kill -0 "$helper" 2>/dev/null || fail helper_exited
+        sleep 1; i=$((i + 1))
+    done
+    test -f /tmp/pageout-ready || fail barrier_timeout
+    if test "$(cat /readonly-probe)" = 1; then
+        /usr/bin/readonly-probe --set /dev/ublkb0 || fail readonly_set_active
+        echo INTEGRATION_READONLY_SWAPPED_PAGES
+    fi
+    if test "$cycle" = 0 && test "$(cat /drain-with-swapped-pages)" = 1; then
+        retained_before=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail retained_digest_before
+        echo INTEGRATION_SWAPPED_DRAIN_BEGIN
+        kill -USR2 "$target" || fail swapped_drain_signal
+        confirm_repeated_drain
+        retained_after=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail retained_digest_after
+        test "$retained_before" = "$retained_after" || fail retained_digest_mismatch
+        echo "INTEGRATION_RETAINED_DIGEST_PASS $retained_after"
+        echo INTEGRATION_SWAPPED_DRAIN_END
+    fi
+    kill -TERM "$target" || fail pending_term
+    sleep 1
+    kill -0 "$target" 2>/dev/null || fail pending_term_exited
+    kill -INT "$target" || fail pending_int
+    sleep 1
+    kill -0 "$target" 2>/dev/null || fail pending_int_exited
+    touch /tmp/pageout-resume || fail barrier_resume
+    wait "$helper" || fail swap_pressure
+    echo INTEGRATION_PENDING_SWAP_SIGNAL_PASS
+    cycle=$((cycle + 1))
+    echo "INTEGRATION_SWAP_CYCLE_PASS cycle=$cycle"
+    done
+    echo INTEGRATION_PAGEOUT_END
+    cat /proc/vmstat | grep -E '^pswp(in|out) '
+fi
+swapoff /dev/ublkb0 || fail swapoff
+if test "$(cat /readonly-probe)" = 1; then
+    swapon /dev/ublkb0 && fail readonly_primary_swapon_accepted
+    swapon /dev/swap-alias && fail readonly_alias_swapon_accepted
+    echo INTEGRATION_READONLY_ACTIVATION_REFUSED
+    /usr/bin/readonly-probe --clear /dev/ublkb0 || fail readonly_clear
+fi
+grep -F '/dev/ublkb0' /proc/swaps && fail swap_remains
+echo INTEGRATION_SWAP_LIFECYCLE_PASS
+if test "$(cat /stop-failure-once)" = 1; then
+    stop_digest=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail stop_digest_before
+fi
+kill -TERM "$target" || fail shutdown_signal
+if test "$(cat /stop-lost-reply)" = 1; then
+    wait_target_log '^UBLK_STOP_RETAINED result=-5 resources_retained=1$'
+    kill -0 "$target" 2>/dev/null || fail lost_reply_target_exited
+    test ! -b /dev/ublkb0 || fail lost_reply_device_still_live
+    echo INTEGRATION_STOP_REPLY_LOST_RETAINED_PASS
+    kill -TERM "$target" || fail lost_reply_retry_signal
+fi
+if test "$(cat /stop-failure-once)" = 1; then
+    wait_target_log '^UBLK_STOP_RETAINED result=-5 resources_retained=1$'
+    test -b /dev/ublkb0 || fail retained_device_missing
+    echo INTEGRATION_STOP_RETAINED_IO_BEGIN
+    retained_digest=$(/usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" --digest-only) || fail stop_digest_after
+    test "$stop_digest" = "$retained_digest" || fail stop_digest_mismatch
+    dd if=/dev/zero of=/dev/ublkb0 bs=4096 count=$(( $(cat /capacity) / 4096 )) oflag=direct || fail retained_zero
+    timeout 20 /usr/bin/test-ublk-real-io /dev/ublkb0 "$(cat /capacity)" || fail retained_io
+    kill -0 "$target" 2>/dev/null || fail retained_target_exited
+    echo INTEGRATION_STOP_RETAINED_IO_PASS
+    kill -TERM "$target" || fail stop_retry_signal
+fi
+i=0
+while kill -0 "$target" 2>/dev/null && test "$i" -lt 10; do
+    sleep 1; i=$((i + 1))
+done
+kill -0 "$target" 2>/dev/null && fail shutdown_timeout
+wait "$target" || fail shutdown_status
+wait "$logger" || fail log_relay
+test ! -b /dev/ublkb0 || fail device_remains
+echo INTEGRATION_SHUTDOWN_PASS
+echo INTEGRATION_PASS
+poweroff -f

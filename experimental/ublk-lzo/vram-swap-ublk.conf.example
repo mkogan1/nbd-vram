@@ -1,0 +1,5 @@
+# Staged example only: review capacity and Btrfs backing before installing in /etc.
+VRAM_UBLK_DEVICE=0
+VRAM_GPU_PAYLOAD_BYTES=1073741824
+VRAM_SWAP_BYTES=2147483648
+VRAM_BACKING_DIRECTORY=/var/lib/vram-swap

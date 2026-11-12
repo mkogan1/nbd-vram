@@ -1,0 +1,30 @@
+[Unit]
+Description=VRAM swap with LZO and Btrfs backing (staged experimental target)
+After=systemd-modules-load.service nvidia-persistenced.service display-manager.service nvidia-resume.service
+Wants=nvidia-persistenced.service
+Conflicts=vram-swap-nbd.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+EnvironmentFile=/etc/vram-swap-ublk.conf
+RuntimeDirectory=ublksrvd
+RuntimeDirectoryPreserve=yes
+ExecCondition=/usr/bin/test -c /dev/ublk-control
+ExecCondition=/usr/bin/test ! -e /run/nbd-vram-sleep-in-progress
+ExecCondition=/usr/bin/test ! -e /run/vram-swap-ublk-sleep-in-progress
+ExecStart=/usr/local/libexec/vram-swap/ublk-lzo-target --host --device ${VRAM_UBLK_DEVICE} --size ${VRAM_SWAP_BYTES} --backing ${VRAM_BACKING_DIRECTORY} --cuda --cuda-vmm --gpu-payload-bytes ${VRAM_GPU_PAYLOAD_BYTES} --kernel-safe-stop --managed-swap
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-1000
+OOMPolicy=continue
+Restart=no
+# Preallocation and swap evacuation must finish before resources are released.
+TimeoutStartSec=infinity
+TimeoutStopSec=infinity
+KillMode=process
+SendSIGKILL=no
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
